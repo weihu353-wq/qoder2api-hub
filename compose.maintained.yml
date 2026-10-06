@@ -1,0 +1,30 @@
+# Build this fork at a reviewed commit; defaults are for isolated acceptance.
+# docker compose -f compose.maintained.yml up -d --build
+services:
+  qoder-maintained:
+    build: .
+    image: qoder2api-hub-maintained:local
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:18790:8790"
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "8790"
+      TZ: "Asia/Shanghai"
+      QD_SCHEDULER_ENABLED: "0"
+      QD_AUTO_CHECKIN: "0"
+      QD_AUTO_QUOTA_REFRESH: "0"
+      QD_DESKTOP_DISCOVERY: "0"
+      QD_CHECKIN_HOURS: "10"
+    volumes:
+      - qoder-maintained-accounts:/app/accounts
+      - qoder-maintained-usage:/app/usage
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8790/ping', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+volumes:
+  qoder-maintained-accounts:
+  qoder-maintained-usage:

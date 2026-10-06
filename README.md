@@ -1,5 +1,10 @@
 # Qoder2API-Hub — 国际版、国内版多账号网关中枢
 
+> **个人维护分支：** [weihu353-wq/qoder2api-hub](https://github.com/weihu353-wq/qoder2api-hub)。
+> 基于上游 v1.2.17，重点维护 Codex 工具闭环、活动窗口签到和离线回归。
+> 版本差异、部署示例、同步与验收流程见 [维护说明](docs/FORK_MAINTENANCE.md)。
+> 本分支的统一测试入口：`python tests/run_offline.py`。
+
 <p align="center">
   <img src="https://img.shields.io/badge/Release-v1.2.17-2496ED?style=flat-square" alt="Version 1.2.17">
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">

@@ -52,7 +52,9 @@ from qoder_accounts import (get_realm_config, gateway_candidates, CLIENT_UA,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.2.17"
+# 个人维护版标识：-codex.N 后缀区分本 fork 与上游同基线版本，
+# 便于 /health、Server header 与日志识别当前跑的是哪一份构建。
+VERSION = "1.2.17-codex.1"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -4125,10 +4127,39 @@ def _is_custom_tool(tool):
     return isinstance(tool, dict) and str(tool.get("type") or "").lower() == "custom"
 
 
+# 上游 chat 端点没有 namespace 概念：namespace 工具出站时压平成
+# "<namespace><sep><tool>" 的单一 function 名，入站再按声明集合还原成官方
+# Responses 的独立 name + namespace 字段（见 _responses_item_name）。
+NAMESPACE_WIRE_SEP = "."
+
+
+def _namespace_wire_name(namespace, name):
+    """Flat chat tool name for a declared namespace/tool pair.
+
+    Decoding always goes through the declared set, never by splitting the
+    string, so a tool name may itself contain the separator.
+    """
+    if not namespace:
+        return name
+    return "%s%s%s" % (namespace, NAMESPACE_WIRE_SEP, name)
+
+
 def custom_tool_names(tools):
-    """Names of tools declared as freeform/custom in a Responses request."""
+    """Names of tools declared as freeform/custom in a Responses request.
+
+    Namespaced custom tools are reported under their flat wire name so the
+    streaming translator recognises them in the upstream chat response.
+    """
     names = set()
     for t in tools or []:
+        if not isinstance(t, dict):
+            continue
+        if str(t.get("type") or "").lower() == "namespace":
+            ns = str(t.get("name") or "")
+            for sub in t.get("tools") or []:
+                if _is_custom_tool(sub) and sub.get("name"):
+                    names.add(_namespace_wire_name(ns, str(sub["name"])))
+            continue
         if _is_custom_tool(t) and t.get("name"):
             names.add(str(t["name"]))
     return names
@@ -4160,14 +4191,172 @@ def _downgrade_custom_tool(tool):
     }
 
 
-def _tools_for_chat(tools):
-    """Downgrade custom tools; leave everything else untouched."""
-    out = []
-    for t in tools or []:
-        if not isinstance(t, dict):
+class UnsupportedToolDeclaration(ValueError):
+    """A Responses tool declaration the chat bridge cannot represent."""
+
+
+def _flatten_responses_tools(tools):
+    """Map Responses tool declarations onto chat-completions tools.
+
+    Returns (chat_tools, wire_map). Namespace tools
+    ({"type": "namespace", "name": ns, "tools": [...]}) group function and
+    custom tools; the upstream chat endpoint has no namespace concept, so each
+    inner tool is advertised under its flat wire name and wire_map decodes
+    that name back to (namespace, name) for the Responses output.
+
+    A declaration that cannot be represented raises UnsupportedToolDeclaration
+    instead of being silently dropped or forwarded to the upstream, where it
+    could only fail after the request had already been accepted.
+    """
+    chat_tools = []
+    wire_map = {}
+    taken = set()
+
+    def claim(wire):
+        # 压平后的名字必须唯一：否则入站解码会把一个名字认成另一个工具。
+        if wire in taken:
+            raise UnsupportedToolDeclaration(
+                "tool name '%s' is declared twice; namespace flattening "
+                "must not shadow another declared tool" % wire)
+        taken.add(wire)
+
+    for decl in tools or []:
+        if not isinstance(decl, dict):
             continue
-        out.append(_downgrade_custom_tool(t) if _is_custom_tool(t) else t)
-    return out
+        kind = str(decl.get("type") or "").lower()
+        if kind == "namespace":
+            ns = decl.get("name")
+            if not isinstance(ns, str) or not ns:
+                raise UnsupportedToolDeclaration(
+                    "namespace tool requires a non-empty name")
+            inner = decl.get("tools")
+            if not isinstance(inner, list) or not inner:
+                raise UnsupportedToolDeclaration(
+                    "namespace '%s' declares no tools" % ns)
+            for sub in inner:
+                if not isinstance(sub, dict):
+                    raise UnsupportedToolDeclaration(
+                        "namespace '%s' contains a non-object tool" % ns)
+                sub_kind = str(sub.get("type") or "").lower()
+                if sub_kind == "namespace":
+                    raise UnsupportedToolDeclaration(
+                        "namespace '%s' nests another namespace" % ns)
+                if sub_kind not in ("function", "custom"):
+                    raise UnsupportedToolDeclaration(
+                        "namespace '%s' declares unsupported tool type %r"
+                        % (ns, sub.get("type")))
+                name = sub.get("name")
+                if not isinstance(name, str) or not name:
+                    raise UnsupportedToolDeclaration(
+                        "namespace '%s' has a tool without a name" % ns)
+                wire = _namespace_wire_name(ns, name)
+                claim(wire)
+                renamed = dict(sub, name=wire)
+                chat_tools.append(_downgrade_custom_tool(renamed)
+                                  if sub_kind == "custom" else renamed)
+                wire_map[wire] = {"namespace": ns, "name": name,
+                                  "custom": sub_kind == "custom"}
+            continue
+        if kind not in ("function", "custom", ""):
+            # 本网关没有内建执行器：web_search / tool_search / mcp / ... 既执行
+            # 不了，转给上游也只会在建流后被判非法。明确拒绝，别让客户端拿着
+            # 一个永远不会成功的工具反复重试。
+            raise UnsupportedToolDeclaration(
+                "tool type %r is not supported by this gateway: it has no "
+                "built-in executor, so it cannot be served through the chat "
+                "upstream" % decl.get("type"))
+        name = decl.get("name")
+        if not isinstance(name, str) or not name:
+            raise UnsupportedToolDeclaration(
+                "tool declaration without a name (type=%r)"
+                % decl.get("type"))
+        claim(name)
+        chat_tools.append(_downgrade_custom_tool(decl)
+                          if kind == "custom" else decl)
+    return chat_tools, wire_map
+
+
+def _chat_tool_choice(choice):
+    """Rewrite a namespaced tool_choice selector onto its flat wire name."""
+    if not isinstance(choice, dict):
+        return choice
+    kind = str(choice.get("type") or "").lower()
+    if kind in ("function", "custom"):
+        ns = choice.get("namespace")
+        name = choice.get("name")
+        if ns and isinstance(name, str) and name:
+            mapped = {k: v for k, v in choice.items() if k != "namespace"}
+            mapped["name"] = _namespace_wire_name(str(ns), name)
+            return mapped
+        return choice
+    if kind == "allowed_tools" and isinstance(choice.get("tools"), list):
+        return dict(choice, tools=[_chat_tool_choice(t)
+                                   if isinstance(t, dict) else t
+                                   for t in choice["tools"]])
+    return choice
+
+
+def _responses_item_name(wire, wire_map):
+    """(name, namespace) for a Responses function/custom output item."""
+    meta = (wire_map or {}).get(wire) if wire else None
+    if isinstance(meta, dict) and meta.get("namespace"):
+        return meta.get("name") or wire, meta["namespace"]
+    return wire, None
+
+
+def _history_wire_name(item, wire_map=None):
+    """Flat chat name for a namespaced function/custom call in the history."""
+    name = item.get("name") or ""
+    ns = item.get("namespace")
+    if not ns:
+        return name
+    return _namespace_wire_name(str(ns), str(name))
+
+
+def _salvage_wrapped_input(raw):
+    """Best-effort {"input": "..."} unwrap for a truncated JSON blob."""
+    marker = '"input"'
+    pos = raw.find(marker)
+    if pos == -1:
+        return None
+    pos = raw.find(":", pos + len(marker))
+    if pos == -1:
+        return None
+    pos = raw.find('"', pos + 1)
+    if pos == -1:
+        return None
+    end = pos + 1
+    while end < len(raw):
+        ch = raw[end]
+        if ch == "\\":
+            end += 2
+            continue
+        if ch == '"':
+            break
+        end += 1
+    literal = raw[pos:min(end + 1, len(raw))]
+    if not literal.endswith('"'):
+        literal += '"'
+    try:
+        return json.loads(literal)
+    except Exception:
+        return None
+
+
+def _custom_input_text(raw):
+    """Unwrapped freeform payload for a custom tool's raw argument blob.
+
+    Upstream wraps the payload as {"input": "..."}; clients must see the
+    payload itself, so the JSON shell is stripped before it reaches
+    custom_tool_call_input events. A blob truncated mid-stream (the response
+    hit max_output_tokens) is salvaged so the wrapper never leaks.
+    """
+    text = _unwrap_custom_input(raw)
+    if isinstance(raw, str) and text == raw and raw.lstrip().startswith("{"):
+        salvaged = _salvage_wrapped_input(raw)
+        if salvaged is not None:
+            return salvaged
+    return text
 
 
 def _unwrap_custom_input(args):
@@ -4189,8 +4378,15 @@ def _unwrap_custom_input(args):
     return args
 
 
-def responses_to_chat(payload):
-    """Translate a Responses API request body into a Chat Completions body."""
+def responses_to_chat(payload, wire_map=None):
+    """Translate a Responses API request body into a Chat Completions body.
+
+    wire_map, when given, is filled with the flat-name -> (namespace, name)
+    table the caller needs to restore namespaced tool calls in the output.
+    """
+    chat_tools, tool_wire = _flatten_responses_tools(payload.get("tools"))
+    if isinstance(wire_map, dict):
+        wire_map.update(tool_wire)
     messages = []
     instructions = payload.get("instructions")
     if isinstance(instructions, str) and instructions.strip():
@@ -4274,7 +4470,7 @@ def responses_to_chat(payload):
                     "id": item.get("call_id") or item.get("id") or "",
                     "type": "function",
                     "function": {
-                        "name": item.get("name") or "",
+                        "name": _history_wire_name(item, tool_wire),
                         "arguments": item.get("arguments") or "{}",
                     },
                 }
@@ -4304,7 +4500,7 @@ def responses_to_chat(payload):
                     "id": item.get("call_id") or item.get("id") or "",
                     "type": "function",
                     "function": {
-                        "name": item.get("name") or "",
+                        "name": _history_wire_name(item, tool_wire),
                         "arguments": json.dumps({"input": raw_input},
                                                 ensure_ascii=False),
                     },
@@ -4359,9 +4555,9 @@ def responses_to_chat(payload):
     if effort:
         chat["reasoning_effort"] = effort
     if payload.get("tools"):
-        chat["tools"] = _tools_for_chat(payload["tools"])
+        chat["tools"] = chat_tools
     if payload.get("tool_choice"):
-        chat["tool_choice"] = payload["tool_choice"]
+        chat["tool_choice"] = _chat_tool_choice(payload["tool_choice"])
     if payload.get("parallel_tool_calls") is not None:
         chat["parallel_tool_calls"] = payload["parallel_tool_calls"]
     return chat
@@ -4385,12 +4581,15 @@ def _responses_usage(u):
     }
 
 
-def chat_to_response(chat_obj, model, custom_names=None):
+def chat_to_response(chat_obj, model, custom_names=None, wire_map=None):
     """Fold a Chat Completions object into a Responses API response object.
 
     custom_names: the set of tool names the client declared as freeform.
     Calls to those tools are re-inflated into custom_tool_call items so
     clients such as Codex recognise them.
+
+    wire_map: flat chat name -> (namespace, name) for namespace tools, so the
+    output items restore the official separate name/namespace fields.
     """
     custom_names = custom_names or set()
     choice = (chat_obj.get("choices") or [{}])[0]
@@ -4408,25 +4607,29 @@ def chat_to_response(chat_obj, model, custom_names=None):
     for tc in msg.get("tool_calls") or []:
         fn = tc.get("function") or {}
         call_id = tc.get("id") or _new_id("call_")
-        name = fn.get("name") or ""
-        if name and name in custom_names:
-            output.append({
+        wire = fn.get("name") or ""
+        name, ns = _responses_item_name(wire, wire_map)
+        if wire and wire in custom_names:
+            item = {
                 "id": _new_id("ctc_"),
                 "type": "custom_tool_call",
                 "status": "completed",
                 "call_id": call_id,
                 "name": name,
-                "input": _unwrap_custom_input(fn.get("arguments") or ""),
-            })
+                "input": _custom_input_text(fn.get("arguments") or ""),
+            }
         else:
-            output.append({
+            item = {
                 "id": _new_id("fc_"),
                 "type": "function_call",
                 "status": "completed",
                 "call_id": call_id,
                 "name": name,
                 "arguments": fn.get("arguments") or "{}",
-            })
+            }
+        if ns:
+            item["namespace"] = ns
+        output.append(item)
     # DeepSeek DSML 工具调用回退
     if not (msg.get("tool_calls")):
         dsml_calls, clean_t = parse_dsml_tool_calls(text)
@@ -4494,6 +4697,7 @@ def stream_responses_events(inner_lines, model, holder):
     text_buffer = ""
     dsml_tool_calls = []
     custom_names = set(holder.get("custom_names") or ())
+    tool_wire = holder.get("tool_wire") if isinstance(holder, dict) else None
 
     def resp_obj(status):
         obj = {
@@ -4581,7 +4785,25 @@ def stream_responses_events(inner_lines, model, holder):
                 fn_name = fn.get("name") or ""
                 fn_args = fn.get("arguments") or ""
                 call_id = tc.get("id") or ""
-                if idx not in tool_calls_map:
+                entry = tool_calls_map.get(idx)
+                if entry is not None and call_id \
+                        and call_id != entry.get("upstream_id"):
+                    if not entry.get("upstream_id"):
+                        # 该 entry 此前没有 upstream id：补记，不拆成新调用。
+                        entry["upstream_id"] = call_id
+                    else:
+                        # 同一 index 换了 upstream call id：上游省略 index
+                        # （并行调用都落到 0）。优先并回已属于该 id 的 entry，
+                        # 否则另开一项，绝不把两个调用的参数拼在一起。
+                        owner = next((k for k, e in tool_calls_map.items()
+                                      if e.get("upstream_id") == call_id), None)
+                        if owner is not None:
+                            idx = owner
+                            entry = tool_calls_map[owner]
+                        else:
+                            idx = max(tool_calls_map) + 1
+                            entry = None
+                if entry is None:
                     out_idx = len(outputs)
                     outputs.append(None)
                     c_id = call_id or _new_id("call_")
@@ -4589,14 +4811,18 @@ def stream_responses_events(inner_lines, model, holder):
                     entry = {
                         "output_index": out_idx,
                         "id": c_id,
-                        "name": fn_name,
-                        "arguments": fn_args,
+                        "upstream_id": call_id,
+                        "wire": fn_name,
+                        "arguments": "",
                         "custom": is_custom,
                         "item_id": _new_id("ctc_" if is_custom else "fc_"),
                     }
                     tool_calls_map[idx] = entry
+                    name, ns = _responses_item_name(fn_name, tool_wire)
                     item = {"id": entry["item_id"], "status": "in_progress",
-                            "call_id": c_id, "name": fn_name}
+                            "call_id": c_id, "name": name}
+                    if ns:
+                        item["namespace"] = ns
                     if is_custom:
                         item["type"] = "custom_tool_call"
                         item["input"] = ""
@@ -4606,26 +4832,22 @@ def stream_responses_events(inner_lines, model, holder):
                     yield ev("response.output_item.added",
                              {"output_index": out_idx, "item": item})
                 else:
-                    entry = tool_calls_map[idx]
-                    if fn_name and not entry["name"]:
-                        entry["name"] = fn_name
+                    if fn_name and not entry.get("wire"):
+                        entry["wire"] = fn_name
                         if fn_name in custom_names:
                             entry["custom"] = True
-                    if fn_args:
-                        entry["arguments"] += fn_args
-                        if entry.get("custom"):
-                            yield ev("response.custom_tool_call_input.delta", {
-                                "output_index": entry["output_index"],
-                                "item_id": entry["item_id"],
-                                "call_id": entry["id"],
-                                "delta": fn_args,
-                            })
-                        else:
-                            yield ev("response.function_call_arguments.delta", {
-                                "output_index": entry["output_index"],
-                                "call_id": entry["id"],
-                                "delta": fn_args,
-                            })
+                if fn_args:
+                    entry["arguments"] += fn_args
+                    # custom 工具的参数是 JSON 包装的原始 payload：逐片透传
+                    # 会让客户端看到 {"input": ...} 外壳，转义也可能跨片。
+                    # 攒到收尾时一次性发解包后的完整文本（见下方收尾循环）。
+                    if not entry.get("custom"):
+                        yield ev("response.function_call_arguments.delta", {
+                            "output_index": entry["output_index"],
+                            "item_id": entry["item_id"],
+                            "call_id": entry["id"],
+                            "delta": fn_args,
+                        })
             piece = delta.get("content")
             if piece:
                 if msg_index is None:
@@ -4751,24 +4973,34 @@ def stream_responses_events(inner_lines, model, holder):
     # 1. 已完成的结构化工具调用
     for idx in sorted(tool_calls_map.keys()):
         entry = tool_calls_map[idx]
+        name, ns = _responses_item_name(entry.get("wire"), tool_wire)
         if entry.get("custom"):
+            payload_text = _custom_input_text(entry["arguments"])
+            if payload_text:
+                yield ev("response.custom_tool_call_input.delta", {
+                    "output_index": entry["output_index"],
+                    "item_id": entry["item_id"],
+                    "call_id": entry["id"],
+                    "delta": payload_text,
+                })
             yield ev("response.custom_tool_call_input.done", {
                 "output_index": entry["output_index"],
                 "item_id": entry["item_id"],
                 "call_id": entry["id"],
-                "input": _unwrap_custom_input(entry["arguments"]),
+                "input": payload_text,
             })
             fc_item = {
                 "id": entry["item_id"],
                 "type": "custom_tool_call",
                 "status": "completed",
                 "call_id": entry["id"],
-                "name": entry["name"],
-                "input": _unwrap_custom_input(entry["arguments"]),
+                "name": name,
+                "input": payload_text,
             }
         else:
             yield ev("response.function_call_arguments.done", {
                 "output_index": entry["output_index"],
+                "item_id": entry["item_id"],
                 "call_id": entry["id"],
                 "arguments": entry["arguments"],
             })
@@ -4777,9 +5009,11 @@ def stream_responses_events(inner_lines, model, holder):
                 "type": "function_call",
                 "status": "completed",
                 "call_id": entry["id"],
-                "name": entry["name"],
+                "name": name,
                 "arguments": entry["arguments"],
             }
+        if ns:
+            fc_item["namespace"] = ns
         outputs[entry["output_index"]] = fc_item
         yield ev("response.output_item.done",
                  {"output_index": entry["output_index"], "item": fc_item})
@@ -4839,14 +5073,17 @@ def stream_responses_events(inner_lines, model, holder):
     if dsml_calls and not tool_calls_map:
         for dc in dsml_calls:
             out_idx = len(outputs)
+            name, ns = _responses_item_name(dc.get("name") or "", tool_wire)
             fc_item = {
                 "id": _new_id("fc_"),
                 "type": "function_call",
                 "status": "completed",
                 "call_id": dc.get("id") or _new_id("call_"),
-                "name": dc.get("name") or "",
+                "name": name,
                 "arguments": dc.get("arguments") or "{}",
             }
+            if ns:
+                fc_item["namespace"] = ns
             outputs.append(fc_item)
             yield ev("response.output_item.added", {
                 "output_index": out_idx,
@@ -4854,11 +5091,13 @@ def stream_responses_events(inner_lines, model, holder):
             })
             yield ev("response.function_call_arguments.delta", {
                 "output_index": out_idx,
+                "item_id": fc_item["id"],
                 "call_id": fc_item["call_id"],
                 "delta": fc_item["arguments"],
             })
             yield ev("response.function_call_arguments.done", {
                 "output_index": out_idx,
+                "item_id": fc_item["id"],
                 "call_id": fc_item["call_id"],
                 "arguments": fc_item["arguments"],
             })
@@ -4899,7 +5138,10 @@ def stream_responses_events(inner_lines, model, holder):
     final = resp_obj(status)
     if finish == "length":
         final["incomplete_details"] = {"reason": "max_output_tokens"}
-    yield ev("response.completed", {"response": final})
+    # 终态事件名必须跟着 status 走：OpenAI 只在完成时发 response.completed，
+    # 截断是 response.incomplete。旧的固定 completed + status=incomplete
+    # 会让客户端把截断当正常收尾。
+    yield ev("response." + status, {"response": final})
 
 
 def _responses_failed_frame(holder, code, message):
@@ -5980,7 +6222,12 @@ class Handler(BaseHTTPRequestHandler):
         """Serve /v1/responses by translating to chat completions upstream."""
         session_key = extract_session_key(self.headers, payload)
         custom_names = custom_tool_names(payload.get("tools"))
-        chat_req = responses_to_chat(payload)
+        tool_wire = {}
+        try:
+            chat_req = responses_to_chat(payload)
+            _, tool_wire = _flatten_responses_tools(payload.get("tools"))
+        except UnsupportedToolDeclaration as exc:
+            return self._error(400, str(exc), "invalid_request_error")
         model = payload.get("model") or "auto"
         want_stream = bool(payload.get("stream"))
         t_start = time.time()
@@ -5990,6 +6237,7 @@ class Handler(BaseHTTPRequestHandler):
                chat_req.get("reasoning_effort"),
                sorted(custom_names) or "-"))
         holder = {"usage": None, "custom_names": custom_names,
+                  "tool_wire": tool_wire,
                   "allowed_names": _tool_names_from_payload(chat_req)}
         try:
             req_realm = self._request_realm() or CURRENT_REALM
@@ -6144,7 +6392,7 @@ class Handler(BaseHTTPRequestHandler):
                              elapsed_ms=int((time.time() - t_start) * 1000))
                 return self._error(502, "upstream stream error: %s" % exc)
             wall = int((time.time() - t_start) * 1000)
-            result = chat_to_response(chat_obj, model, custom_names)
+            result = chat_to_response(chat_obj, model, custom_names, tool_wire)
             record_usage(model, chat_obj.get("usage"), stream=False,
                          elapsed_ms=wall, fp=fp, account=account.uid)
             return self._json(200, result)
@@ -6494,23 +6742,34 @@ def main():
     SCHEDULER = Scheduler(POOL)
     SCHEDULER.start()
 
+    # 隔离 / 无人值守环境可关闭本机凭据探测（QD_DESKTOP_DISCOVERY=0），
+    # 关闭时绝不读取用户 Qoder 客户端凭据；默认保持原行为（探测但不导入）。
+    desktop_discovery = (os.environ.get("QD_DESKTOP_DISCOVERY") or "1") \
+        .strip().lower() not in ("0", "false", "no")
     if not POOL.accounts:
         # 永不静默采用本机客户端登录：先报告扫描结果，由用户在看板确认导入。
-        try:
-            detected = qoder_accounts.scan_desktop_credentials()
-        except Exception:
-            detected = []
-        usable = [d for d in detected if d.get("valid")]
-        if usable:
-            log("no accounts yet - detected %d local credential(s), NOT importing"
-                % len(usable))
-            for d in usable:
-                log("  available: %s  %s  %s" % (
-                    (d.get("uid") or "?")[:8], d.get("nickname") or "(no name)",
-                    d.get("realmName") or d.get("realm")))
-            log("open the dashboard and click [Scan local credentials] to import")
+        if not desktop_discovery:
+            log("no accounts yet - local credential discovery disabled "
+                "(QD_DESKTOP_DISCOVERY=0)")
         else:
-            log("no accounts yet - no local Qoder credentials found on this machine")
+            try:
+                detected = qoder_accounts.scan_desktop_credentials()
+            except Exception:
+                detected = []
+            usable = [d for d in detected if d.get("valid")]
+            if usable:
+                log("no accounts yet - detected %d local credential(s), "
+                    "NOT importing" % len(usable))
+                for d in usable:
+                    log("  available: %s  %s  %s" % (
+                        (d.get("uid") or "?")[:8],
+                        d.get("nickname") or "(no name)",
+                        d.get("realmName") or d.get("realm")))
+                log("open the dashboard and click [Scan local credentials] "
+                    "to import")
+            else:
+                log("no accounts yet - no local Qoder credentials found on "
+                    "this machine")
         # 不在这里退出：看板必须可达，才能通过浏览器完成登录。
     rep = current_account()
     log("accounts   : %d total, %d usable"
@@ -6599,6 +6858,12 @@ def main():
     except KeyboardInterrupt:
         log("bye")
     finally:
+        # 调度线程必须先停：否则 server_close 之后它仍会继续跑巡检。
+        if SCHEDULER:
+            try:
+                SCHEDULER.stop()
+            except Exception:
+                pass
         try:
             server.server_close()
         except Exception:

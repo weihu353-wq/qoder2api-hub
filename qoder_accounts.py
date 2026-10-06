@@ -847,6 +847,15 @@ CHECKIN_WINDOW_HOUR_UTC8 = 10
 _UTC8 = datetime.timezone(datetime.timedelta(hours=8))
 
 
+def checkin_window_day(now=None):
+    """Return the UTC+8 activity date; the new window opens at 10:00."""
+    stamp = time.time() if now is None else float(now)
+    current = datetime.datetime.fromtimestamp(stamp, _UTC8)
+    if current.hour < CHECKIN_WINDOW_HOUR_UTC8:
+        current -= datetime.timedelta(days=1)
+    return current.strftime("%Y-%m-%d")
+
+
 def next_checkin_window(now=None):
     """下一个「每日 10:00（UTC+8）」窗口 → (epoch 秒:int, 人类可读:str)。
 
@@ -1007,6 +1016,7 @@ class Account(object):
         self.credits = data.get("credits") or None
         self.plan = str(data.get("plan") or "")
         self.last_checkin = data.get("lastCheckin") or None
+        self.last_checkin_window = str(data.get("lastCheckinWindow") or "")
         # 已领取活动的兑换码（如「奶茶免单卡」REDEMPTION_CODE）：活动只发一次，
         # 必须落盘持久化，否则网关重启后用户就找不回兑换码了。
         self.campaign_codes = dict(data.get("campaignCodes") or {})
@@ -1052,6 +1062,7 @@ class Account(object):
             "credits": self.credits,
             "plan": self.plan,
             "lastCheckin": self.last_checkin,
+            "lastCheckinWindow": self.last_checkin_window,
             "campaignCodes": self.campaign_codes,
             "campaignBlockedUntil": self.campaign_blocked_until,
             "userType": self.user_type,
@@ -1340,14 +1351,22 @@ class Account(object):
         return self._checkin_cap, self._checkin_cap_reason
 
     def can_checkin(self):
-        """今日是否还需要签到（能力由运行时探测，不再按区域硬编码）。"""
+        """Whether this UTC+8 activity window still needs a claim."""
         capable, _ = self.checkin_capability()
         if capable is False:
             return False
+        window = checkin_window_day()
+        if self.last_checkin_window:
+            return self.last_checkin_window != window
         if not self.last_checkin:
             return True
-        today_str = time.strftime("%Y-%m-%d")
-        return not str(self.last_checkin).startswith(today_str)
+        # Legacy timestamps were written in the host's local timezone. Infer
+        # their activity date once; new claims persist an explicit window date.
+        try:
+            previous = datetime.datetime.fromisoformat(str(self.last_checkin))
+            return checkin_window_day(previous.timestamp()) != window
+        except (ValueError, TypeError, OverflowError):
+            return True
 
     def checkin_status(self):
         """GET daily-check-in/status -> (ok, summary|error)。
@@ -1829,7 +1848,9 @@ class Account(object):
 
 
     def _stamp_checkin(self):
-        self.last_checkin = time.strftime("%Y-%m-%d %H:%M:%S")
+        stamp = time.time()
+        self.last_checkin = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(stamp))
+        self.last_checkin_window = checkin_window_day(stamp)
         if self.path and os.path.exists(os.path.dirname(self.path)):
             self.save(os.path.dirname(self.path))
 

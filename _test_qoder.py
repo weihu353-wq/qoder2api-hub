@@ -8,13 +8,10 @@ translation, and check-in response normalization.
     python _test_qoder.py
 
 外部 fixture（可选）：[4.5] 组的官方加解密 KAT 需要协议 fixture 目录
-（内含 credential.json 与 model-cache.json）。目录按以下顺序自动探测：
-    1) 环境变量 QD_TEST_FIXTURE_DIR
-    2) <仓库>/testdata/protocol/1.1.34
-    3) <仓库>/tests/fixtures/protocol/1.1.34
-    4) <仓库>/../qoder-ref/cli2api/testdata/protocol/1.1.34
-    5) %TEMP%/qoder-ref/cli2api/testdata/protocol/1.1.34
-    6) ~/qoder-ref/cli2api/testdata/protocol/1.1.34
+（内含 credential.json 与 model-cache.json）。只读取明确提供的合成测试资料：
+    1) 显式设置 QD_TEST_FIXTURE_DIR 时只检查该目录，不回退其他目录
+    2) 否则仅检查本仓库 testdata/protocol/1.1.34 与 tests/fixtures/protocol/1.1.34
+不自动搜索用户主目录、系统临时目录或相邻项目中的 credential.json。
 缺 fixture 时依赖它的 3 条断言打印 [SKIP]（不计失败），**绝不静默**：
 [SKIP] 行、候选清单、末行汇总都会报出跳过数量。同组的 AES-256
 密钥表 / 互逆 KAT 不依赖 fixture，永远执行。
@@ -1373,19 +1370,12 @@ check("job family", A.token_family(acc_j) == "job")
 print()
 print("[4.5] credential / model-cache crypto KATs (official fixtures)")
 import base64 as _b64
-# fixture 探测：环境变量优先，其次按候选顺序找；不再硬编码单个 %TEMP% 路径。
+# Fixture discovery stays inside this repository unless explicitly opted in.
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _FIX_ENV = os.environ.get("QD_TEST_FIXTURE_DIR") or ""
-_FIX_CANDIDATES = [
-    _FIX_ENV,
+_FIX_CANDIDATES = [_FIX_ENV] if _FIX_ENV else [
     os.path.join(_HERE, "testdata", "protocol", "1.1.34"),
     os.path.join(_HERE, "tests", "fixtures", "protocol", "1.1.34"),
-    os.path.join(_HERE, os.pardir, "qoder-ref", "cli2api", "testdata",
-                 "protocol", "1.1.34"),
-    os.path.join(os.environ.get("TEMP") or os.environ.get("TMP") or "/tmp",
-                 "qoder-ref", "cli2api", "testdata", "protocol", "1.1.34"),
-    os.path.join(os.path.expanduser("~"), "qoder-ref", "cli2api",
-                 "testdata", "protocol", "1.1.34"),
 ]
 if _FIX_ENV and not os.path.isdir(_FIX_ENV):
     print("  [WARN] QD_TEST_FIXTURE_DIR 指向的目录不存在：%s" % _FIX_ENV)
