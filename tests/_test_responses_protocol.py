@@ -52,6 +52,11 @@ os.environ["QD_DESKTOP_DISCOVERY"] = "0"
 import qoder_proxy as P  # noqa: E402
 import qoder_accounts as A  # noqa: E402
 
+# Resolved defensively so that running this suite against a build without the
+# helpers reports ordinary failures instead of aborting on AttributeError.
+_valid_wire = getattr(P, "_valid_wire_name", lambda _n: False)
+_wire_name = getattr(P, "_namespace_wire_name", lambda _ns, _n: _n)
+
 PASS = 0
 FAIL = 0
 
@@ -141,6 +146,12 @@ def item_done(events, itype):
 def added_items(events):
     return {p["output_index"]: p["item"]
             for p in evs(events, "response.output_item.added")}
+
+
+def first_item(events, itype):
+    """The first finished item of `itype`, or {} so checks can just fail."""
+    items = item_done(events, itype)
+    return items[0] if items else {}
 
 
 def joined(events, name, output_index):
@@ -436,7 +447,9 @@ NS_TOOLS = [{
         "parameters": {"type": "object", "properties": {}},
     }],
 }]
-WIRE = "crm.list_open_orders"
+WIRE = "crm__list_open_orders"
+check("the flat wire name uses the chat-safe separator",
+      WIRE == _wire_name("crm", "list_open_orders"), WIRE)
 chat = P.responses_to_chat({"model": "m", "input": "hi", "tools": NS_TOOLS})
 tools = chat.get("tools") or []
 check("the namespace flattens into one chat tool", len(tools) == 1, tools)
@@ -448,23 +461,27 @@ holder = {"usage": None, "custom_names": P.custom_tool_names(NS_TOOLS)}
 _, holder["tool_wire"] = P._flatten_responses_tools(NS_TOOLS)
 events = run([tool_chunk(0, "call_ns", WIRE, '{"limit":5}'),
               sse({}, "tool_calls")], holder=holder)
-added_item = evs(events, "response.output_item.added")[0]["item"]
-done = evs(events, ARG_DONE)[0]
-final = item_done(events, "function_call")[0]
+_added = evs(events, "response.output_item.added")
+added_item = _added[0]["item"] if _added else {}
+_done = evs(events, ARG_DONE)
+done = _done[0] if _done else {}
+final = first_item(events, "function_call")
 check("the call comes back as the bare tool name",
-      added_item["name"] == "list_open_orders", added_item)
+      added_item.get("name") == "list_open_orders", added_item)
 check("the namespace travels beside the name",
       added_item.get("namespace") == "crm", added_item)
 check("the flat wire name is never exposed to the client",
-      added_item["name"] != WIRE and final["name"] == "list_open_orders", final)
+      added_item.get("name") != WIRE
+      and final.get("name") == "list_open_orders", final)
 check("the namespace survives into the final item",
       final.get("namespace") == "crm", final)
 check("namespace call_ids stay consistent",
-      added_item["call_id"] == done["call_id"] == final["call_id"] == "call_ns",
-      (added_item["call_id"], done["call_id"], final["call_id"]))
+      added_item.get("call_id") == done.get("call_id")
+      == final.get("call_id") == "call_ns",
+      (added_item.get("call_id"), done.get("call_id"), final.get("call_id")))
 check("namespace item ids stay consistent",
-      added_item["id"] == done["item_id"] == final["id"],
-      (added_item["id"], done["item_id"], final["id"]))
+      added_item.get("id") == done.get("item_id") == final.get("id"),
+      (added_item.get("id"), done.get("item_id"), final.get("id")))
 hchat = P.responses_to_chat({"model": "m", "tools": NS_TOOLS, "input": [
     {"type": "function_call", "name": "list_open_orders", "namespace": "crm",
      "call_id": "call_ns", "arguments": '{"limit":5}'},
@@ -506,12 +523,12 @@ NS_TWO = [
 chat = P.responses_to_chat({"model": "m", "input": "hi", "tools": NS_TWO})
 tools = chat.get("tools") or []
 check("both namespaced tools are advertised",
-      sorted(t.get("name") for t in tools) == ["billing.list", "crm.list"],
+      sorted(t.get("name") for t in tools) == ["billing__list", "crm__list"],
       tools)
 holder = {"usage": None, "custom_names": set()}
 _, holder["tool_wire"] = P._flatten_responses_tools(NS_TWO)
-events = run([tool_chunk(0, "call_b", "billing.list", '{"p":1}'),
-              tool_chunk(1, "call_c", "crm.list", '{"p":2}'),
+events = run([tool_chunk(0, "call_b", "billing__list", '{"p":1}'),
+              tool_chunk(1, "call_c", "crm__list", '{"p":2}'),
               sse({}, "tool_calls")], holder=holder)
 finals = {it["call_id"]: it for it in item_done(events, "function_call")}
 check("each call decodes to its own namespace",
@@ -530,7 +547,7 @@ NS_CUSTOM = [{
                "format": {"type": "grammar", "syntax": "lark",
                           "definition": "start: /.+/"}}],
 }]
-WIRE_C = "patchbox.apply_patch"
+WIRE_C = "patchbox__apply_patch"
 custom_names = P.custom_tool_names(NS_CUSTOM)
 check("a namespaced custom tool is reported under its wire name",
       custom_names == {WIRE_C}, custom_names)
@@ -544,12 +561,12 @@ _, holder["tool_wire"] = P._flatten_responses_tools(NS_CUSTOM)
 events = run(split_tool_chunks(0, WIRE_C,
                                json.dumps({"input": PATCH}, ensure_ascii=False)),
              holder=holder)
-final = item_done(events, "custom_tool_call")[0]
+final = first_item(events, "custom_tool_call")
 check("a namespaced custom call restores name + namespace",
-      final["name"] == "apply_patch"
+      final.get("name") == "apply_patch"
       and final.get("namespace") == "patchbox", final)
 check("a namespaced custom call unwraps its input",
-      final["input"] == PATCH, final["input"])
+      final.get("input") == PATCH, final.get("input"))
 
 print()
 print("[12] unsupported namespace declarations are rejected, not dropped")
@@ -603,9 +620,9 @@ NS_CRASH = [{"type": "namespace", "name": "crm", "tools": [
     {"type": "function", "name": "list_open_orders"}]}]
 COLLIDE = [
     ("a top-level function shadowed by a namespace wire name",
-     NS_CRASH + [{"type": "function", "name": "crm.list_open_orders"}]),
+     NS_CRASH + [{"type": "function", "name": "crm__list_open_orders"}]),
     ("a namespace wire name shadowed by a top-level function",
-     [{"type": "function", "name": "crm.list_open_orders"}] + NS_CRASH),
+     [{"type": "function", "name": "crm__list_open_orders"}] + NS_CRASH),
     ("two namespaces flattening onto the same wire name",
      [{"type": "namespace", "name": "crm", "tools": [
          {"type": "function", "name": "list"}]},
@@ -677,6 +694,172 @@ finally:
     A.scan_desktop_credentials = _orig_scan
     P.ThreadingHTTPServer.serve_forever = _orig_serve
     P.ThreadingHTTPServer.server_close = _orig_close
+
+print()
+print("[14] truncated tool calls are not reported as completed")
+
+
+def cut_chunks(call_id, name, blob, finish, size=9):
+    """Like split_tool_chunks, but the stream ends with `finish`."""
+    chunks = split_tool_chunks(call_id, name, blob, size)
+    chunks[-1] = sse({}, finish)
+    return chunks
+
+
+def _is_json(raw):
+    try:
+        json.loads(raw)
+        return True
+    except Exception:
+        return False
+
+
+_wrapper_full = json.dumps({"input": PATCH}, ensure_ascii=False)
+_wrapper_cut = _wrapper_full[:len(_wrapper_full) // 2]
+check("the cut wrapper really is invalid JSON", not _is_json(_wrapper_cut),
+      _wrapper_cut)
+events = run(cut_chunks(0, "apply_patch", _wrapper_cut, "length"),
+             holder={"usage": None, "custom_names": {"apply_patch"}})
+final = item_done(events, "custom_tool_call")
+check("a truncated custom item is marked incomplete",
+      bool(final) and final[0]["status"] == "incomplete", final)
+check("a truncated custom call emits no custom_tool_call_input.done",
+      not evs(events, CUSTOM_DONE), evs(events, CUSTOM_DONE))
+check("a truncated custom call emits no input delta",
+      not evs(events, CUSTOM_DELTA), evs(events, CUSTOM_DELTA))
+check("a truncated custom stream ends with response.incomplete",
+      events[-1][0] == "response.incomplete", events[-1][0])
+
+_fargs = json.dumps({"path": "a.txt"})
+_fcut = _fargs[:5]
+check("the cut function arguments really are invalid JSON",
+      not _is_json(_fcut), _fcut)
+events = run(cut_chunks(0, "read_file", _fcut, "length"))
+final = item_done(events, "function_call")
+check("a truncated function item is marked incomplete",
+      bool(final) and final[0]["status"] == "incomplete", final)
+check("a truncated function call emits no arguments.done",
+      not evs(events, ARG_DONE), evs(events, ARG_DONE))
+check("a truncated function stream ends with response.incomplete",
+      events[-1][0] == "response.incomplete", events[-1][0])
+
+events = run(cut_chunks(0, "read_file", _fargs, "length"))
+final = item_done(events, "function_call")
+check("complete arguments under length stay completed",
+      bool(final) and final[0]["status"] == "completed"
+      and bool(evs(events, ARG_DONE)), final)
+check("complete arguments under length still end with response.incomplete",
+      events[-1][0] == "response.incomplete", events[-1][0])
+
+_obj = P.chat_to_response({"choices": [{"finish_reason": "length", "message": {
+    "role": "assistant", "content": "",
+    "tool_calls": [{"id": "call_t", "type": "function", "function": {
+        "name": "apply_patch", "arguments": _wrapper_cut}}]}}]},
+    "m", {"apply_patch"})
+check("non-stream: a truncated custom item is incomplete",
+      _obj["output"][0]["type"] == "custom_tool_call"
+      and _obj["output"][0]["status"] == "incomplete", _obj["output"][0])
+check("non-stream: the truncated response is incomplete",
+      _obj["status"] == "incomplete"
+      and _obj.get("incomplete_details") == {"reason": "max_output_tokens"},
+      _obj)
+_obj = P.chat_to_response({"choices": [{"finish_reason": "length", "message": {
+    "role": "assistant", "content": "",
+    "tool_calls": [{"id": "call_f", "type": "function", "function": {
+        "name": "read_file", "arguments": _fcut}}]}}]}, "m")
+check("non-stream: a truncated function item is incomplete",
+      _obj["output"][0]["type"] == "function_call"
+      and _obj["output"][0]["status"] == "incomplete", _obj["output"][0])
+
+print()
+print("[15] flat wire names stay inside the chat charset and length")
+LONG_NS = "n" * 60
+LONG_TOOL = "t" * 60
+LONG_TOOLS = [{"type": "namespace", "name": LONG_NS, "tools": [
+    {"type": "function", "name": LONG_TOOL}]}]
+_long_wire = _wire_name(LONG_NS, LONG_TOOL)
+check("an over-long pair is replaced by a short alias",
+      len(_long_wire) <= 64 and _valid_wire(_long_wire), _long_wire)
+check("the alias is stable for the same pair",
+      _long_wire == _wire_name(LONG_NS, LONG_TOOL), _long_wire)
+check("the alias differs for a different pair",
+      _long_wire != _wire_name(LONG_NS, LONG_TOOL + "x"),
+      _long_wire)
+UNI_NS = "crm"
+UNI_TOOL = "\u8ba2\u5355"
+UNI_TOOLS = [{"type": "namespace", "name": UNI_NS, "tools": [
+    {"type": "function", "name": UNI_TOOL}]}]
+check("a non-ASCII pair is replaced by an ASCII alias",
+      _valid_wire(_wire_name(UNI_NS, UNI_TOOL)),
+      _wire_name(UNI_NS, UNI_TOOL))
+check("a short ASCII pair keeps the readable form",
+      _wire_name("crm", "list") == "crm__list",
+      _wire_name("crm", "list"))
+for _label, _tools, _ns, _tool in (("over-long", LONG_TOOLS, LONG_NS, LONG_TOOL),
+                                   ("non-ASCII", UNI_TOOLS, UNI_NS, UNI_TOOL)):
+    _wire = _wire_name(_ns, _tool)
+    _chat = P.responses_to_chat({"model": "m", "input": "hi", "tools": _tools})
+    check("[%s] the upstream only sees valid wire names" % _label,
+          all(_valid_wire(t.get("name") or "")
+              for t in _chat["tools"]), [t.get("name") for t in _chat["tools"]])
+    _holder = {"usage": None, "custom_names": set()}
+    _, _holder["tool_wire"] = P._flatten_responses_tools(_tools)
+    _events = run([tool_chunk(0, "call_x", _wire, '{"k":1}'),
+                   sse({}, "tool_calls")], holder=_holder)
+    _final = first_item(_events, "function_call")
+    check("[%s] the client gets the original name back" % _label,
+          _final.get("name") == _tool, _final)
+    check("[%s] the namespace comes back with it" % _label,
+          _final.get("namespace") == _ns, _final)
+
+print()
+print("[16] custom tool whose name arrives after the first argument shard")
+_late = [tool_chunk(0, "call_late", "", _wrapper_full[:10])]
+for _i in range(10, len(_wrapper_full), 10):
+    _late.append(tool_chunk(0, "", "", _wrapper_full[_i:_i + 10]))
+_late.insert(2, tool_chunk(0, "", "apply_patch", ""))
+_late.append(sse({}, "tool_calls"))
+events = run(_late, holder={"usage": None, "custom_names": {"apply_patch"}})
+added = evs(events, "response.output_item.added")
+final = item_done(events, "custom_tool_call")
+check("the item is announced as custom_tool_call, never as function_call",
+      bool(added) and all(p["item"].get("type") == "custom_tool_call"
+                          for p in added),
+      [p["item"].get("type") for p in added])
+check("the first shard's arguments survive the late name",
+      bool(final) and final[0]["input"] == PATCH, final)
+check("the late-named custom call still gets its input delta",
+      bool(evs(events, CUSTOM_DELTA)), evs(events, CUSTOM_DELTA))
+
+events = run([tool_chunk(0, "call_lf", "", '{"pa'),
+              tool_chunk(0, "", "read_file", ""),
+              tool_chunk(0, "", "", 'th":"a.txt"}'),
+              sse({}, "tool_calls")])
+added = evs(events, "response.output_item.added")
+deltas = evs(events, ARG_DELTA)
+final = item_done(events, "function_call")
+check("a late-named function tool is announced as function_call",
+      bool(added) and added[0]["item"]["type"] == "function_call", added)
+check("a late-named function tool replays the buffered arguments",
+      "".join(d["delta"] for d in deltas) == '{"path":"a.txt"}',
+      "".join(d["delta"] for d in deltas))
+check("a late-named function tool's final arguments are complete",
+      bool(final) and final[0]["arguments"] == '{"path":"a.txt"}', final)
+
+events = run([tool_chunk(0, "call_u", "", '{"a":1}'), sse({}, "tool_calls")])
+check("an unnamed tool call fails explicitly",
+      events[-1][0] == "response.failed"
+      and events[-1][1]["response"]["status"] == "failed", events[-1])
+check("no empty-name tool item is emitted",
+      not item_done(events, "function_call")
+      and not item_done(events, "custom_tool_call"))
+_obj = P.chat_to_response({"choices": [{"finish_reason": "tool_calls", "message": {
+    "role": "assistant", "content": "",
+    "tool_calls": [{"id": "call_u", "type": "function",
+                    "function": {"name": "", "arguments": "{}"}}]}}]}, "m")
+check("non-stream: an unnamed tool call fails explicitly",
+      _obj["status"] == "failed"
+      and _obj["error"]["code"] == "invalid_tool_call", _obj)
 
 print()
 print("=" * 62)

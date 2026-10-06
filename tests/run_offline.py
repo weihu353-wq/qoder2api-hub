@@ -47,12 +47,17 @@ if sys.argv[2] == 'unittest':
     if not suite.countTestCases():
         raise RuntimeError('No maintained regression tests were discovered')
     result = unittest.TextTestRunner(verbosity=2).run(suite)
+    print('UNITTEST: total=%d skipped=%d failures=%d errors=%d' % (
+        result.testsRun, len(result.skipped), len(result.failures), len(result.errors)))
     raise SystemExit(not result.wasSuccessful())
 runpy.run_path(sys.argv[1] + '/' + sys.argv[2], run_name='__main__')
 """
 
 
 def main():
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, 'reconfigure'):
+            stream.reconfigure(encoding='utf-8', errors='replace')
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--verbose', action='store_true')
     args = parser.parse_args()
@@ -92,6 +97,7 @@ def main():
                 summaries = [line for line in combined.splitlines()
                              if '[SKIP]' in line or line.startswith('SUMMARY:')
                              or line.startswith('responses protocol:')
+                             or line.startswith('UNITTEST:')
                              or line.startswith('Ran ') or line.strip() == 'OK']
                 for line in summaries:
                     print('  ' + line)

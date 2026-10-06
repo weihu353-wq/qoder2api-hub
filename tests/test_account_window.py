@@ -1,8 +1,11 @@
 """Activity windows use UTC+8 and survive process/account reconstruction."""
 import datetime
+from pathlib import Path
+import sys
 import unittest
 from unittest import mock
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import qoder_accounts as accounts
 
 

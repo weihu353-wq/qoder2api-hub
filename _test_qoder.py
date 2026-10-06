@@ -304,11 +304,8 @@ print("[5.8] off-peak (低谷) window detection — cross-midnight 22:00-08:00 U
 import datetime as _dt
 def _ts(h, m):
     # 构造 UTC+8 指定时刻对应的 epoch（固定 +8 与官方时区一致）
-    utc_naive = _dt.datetime.utcnow() if False else None
-    base = _dt.datetime.now(_dt.timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-    target_local_naive = _dt.datetime.now().replace(hour=h, minute=m, second=0, microsecond=0)
-    return target_local_naive.timestamp() - (_dt.datetime.now().astimezone().utcoffset().total_seconds()
-                                             - 8 * 3600)
+    return _dt.datetime(2026, 10, 6, h, m,
+                        tzinfo=_dt.timezone(_dt.timedelta(hours=8))).timestamp()
 for hh, mm, expect, label in [
         (1, 0, True, "01:00 inside window"),
         (12, 0, False, "12:00 outside"),

@@ -4130,7 +4130,23 @@ def _is_custom_tool(tool):
 # 上游 chat 端点没有 namespace 概念：namespace 工具出站时压平成
 # "<namespace><sep><tool>" 的单一 function 名，入站再按声明集合还原成官方
 # Responses 的独立 name + namespace 字段（见 _responses_item_name）。
-NAMESPACE_WIRE_SEP = "."
+#
+# chat 工具名的通用约束是 [A-Za-z0-9_-] 且 <= 64 字符，所以分隔符取 "__"
+# （合法字符，MCP 风格），压平后超长或含非法字符时换成稳定短别名——别名
+# 只存在于上游一侧，客户端拿到的始终是原始 name + namespace。
+NAMESPACE_WIRE_SEP = "__"
+WIRE_NAME_MAX = 64
+WIRE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _valid_wire_name(name):
+    return (isinstance(name, str) and 0 < len(name) <= WIRE_NAME_MAX
+            and WIRE_NAME_RE.match(name) is not None)
+
+
+def _alias_wire_name(seed):
+    """Stable short alias for a pair that does not fit the chat charset."""
+    return "ns_" + hashlib.sha1(seed.encode("utf-8")).hexdigest()[:16]
 
 
 def _namespace_wire_name(namespace, name):
@@ -4141,7 +4157,10 @@ def _namespace_wire_name(namespace, name):
     """
     if not namespace:
         return name
-    return "%s%s%s" % (namespace, NAMESPACE_WIRE_SEP, name)
+    wire = "%s%s%s" % (namespace, NAMESPACE_WIRE_SEP, name)
+    if _valid_wire_name(wire):
+        return wire
+    return _alias_wire_name("%s\0%s" % (namespace, name))
 
 
 def custom_tool_names(tools):
@@ -4357,6 +4376,26 @@ def _custom_input_text(raw):
         if salvaged is not None:
             return salvaged
     return text
+
+
+def _tool_payload_complete(raw):
+    """Whether accumulated tool arguments are usable as they stand.
+
+    A stream cut off by max_output_tokens (finish_reason == "length") can stop
+    mid-JSON. Such a call must be reported as incomplete instead of being
+    handed to the client as an executable payload. An empty argument string is
+    the upstream's "no arguments" form, not evidence of truncation.
+    """
+    if not isinstance(raw, str):
+        return False
+    text = raw.strip()
+    if not text:
+        return True
+    try:
+        json.loads(text)
+    except Exception:
+        return False
+    return True
 
 
 def _unwrap_custom_input(args):
@@ -4581,6 +4620,24 @@ def _responses_usage(u):
     }
 
 
+def _failed_response(model, code, message):
+    """A Responses object for an upstream reply that cannot be represented."""
+    return {
+        "id": _new_id("resp_"),
+        "object": "response",
+        "created_at": int(time.time()),
+        "status": "failed",
+        "model": model,
+        "output": [],
+        "output_text": "",
+        "error": {"code": str(code), "message": message},
+        "parallel_tool_calls": True,
+        "tool_choice": "auto",
+        "tools": [],
+        "metadata": {},
+    }
+
+
 def chat_to_response(chat_obj, model, custom_names=None, wire_map=None):
     """Fold a Chat Completions object into a Responses API response object.
 
@@ -4596,6 +4653,8 @@ def chat_to_response(chat_obj, model, custom_names=None, wire_map=None):
     msg = choice.get("message") or {}
     text = msg.get("content") or ""
     reasoning = msg.get("reasoning_content") or ""
+    finish = choice.get("finish_reason") or "stop"
+    truncated = finish == "length"
     output = []
     if reasoning:
         output.append({
@@ -4608,24 +4667,33 @@ def chat_to_response(chat_obj, model, custom_names=None, wire_map=None):
         fn = tc.get("function") or {}
         call_id = tc.get("id") or _new_id("call_")
         wire = fn.get("name") or ""
+        if not wire:
+            # 空名工具调用：明确失败，不返回空名工具项。
+            return _failed_response(
+                model, "invalid_tool_call",
+                "upstream returned a tool call without a name")
         name, ns = _responses_item_name(wire, wire_map)
-        if wire and wire in custom_names:
+        raw_args = fn.get("arguments") or ""
+        status = ("incomplete"
+                  if truncated and not _tool_payload_complete(raw_args)
+                  else "completed")
+        if wire in custom_names:
             item = {
                 "id": _new_id("ctc_"),
                 "type": "custom_tool_call",
-                "status": "completed",
+                "status": status,
                 "call_id": call_id,
                 "name": name,
-                "input": _custom_input_text(fn.get("arguments") or ""),
+                "input": _custom_input_text(raw_args),
             }
         else:
             item = {
                 "id": _new_id("fc_"),
                 "type": "function_call",
-                "status": "completed",
+                "status": status,
                 "call_id": call_id,
                 "name": name,
-                "arguments": fn.get("arguments") or "{}",
+                "arguments": raw_args or "{}",
             }
         if ns:
             item["namespace"] = ns
@@ -4635,13 +4703,17 @@ def chat_to_response(chat_obj, model, custom_names=None, wire_map=None):
         dsml_calls, clean_t = parse_dsml_tool_calls(text)
         if dsml_calls:
             for dc in dsml_calls:
+                dsml_args = dc.get("arguments") or "{}"
                 output.append({
                     "id": _new_id("fc_"),
                     "type": "function_call",
-                    "status": "completed",
+                    "status": ("incomplete"
+                               if truncated
+                               and not _tool_payload_complete(dsml_args)
+                               else "completed"),
                     "call_id": dc.get("id") or _new_id("call_"),
                     "name": dc.get("name") or "",
-                    "arguments": dc.get("arguments") or "{}",
+                    "arguments": dsml_args,
                 })
             text = clean_t
     if text or not output:
@@ -4653,7 +4725,6 @@ def chat_to_response(chat_obj, model, custom_names=None, wire_map=None):
             "content": [{"type": "output_text", "text": text,
                          "annotations": []}] if text else [],
         })
-    finish = choice.get("finish_reason") or "stop"
     obj = {
         "id": _new_id("resp_"),
         "object": "response",
@@ -4806,42 +4877,55 @@ def stream_responses_events(inner_lines, model, holder):
                 if entry is None:
                     out_idx = len(outputs)
                     outputs.append(None)
-                    c_id = call_id or _new_id("call_")
-                    is_custom = bool(fn_name) and fn_name in custom_names
                     entry = {
                         "output_index": out_idx,
-                        "id": c_id,
+                        "id": call_id or _new_id("call_"),
                         "upstream_id": call_id,
-                        "wire": fn_name,
+                        "wire": "",
                         "arguments": "",
-                        "custom": is_custom,
-                        "item_id": _new_id("ctc_" if is_custom else "fc_"),
+                        "custom": False,
+                        "item_id": "",
+                        "announced": False,
                     }
                     tool_calls_map[idx] = entry
-                    name, ns = _responses_item_name(fn_name, tool_wire)
+                if fn_name and not entry["wire"]:
+                    entry["wire"] = fn_name
+                if entry["wire"] and not entry["announced"]:
+                    # name 到齐才发 output_item.added：function / custom 的类型
+                    # 必须一次定死，不能先按 function 宣告再改成 custom_tool_call。
+                    entry["custom"] = entry["wire"] in custom_names
+                    entry["item_id"] = _new_id(
+                        "ctc_" if entry["custom"] else "fc_")
+                    entry["announced"] = True
+                    name, ns = _responses_item_name(entry["wire"], tool_wire)
                     item = {"id": entry["item_id"], "status": "in_progress",
-                            "call_id": c_id, "name": name}
+                            "call_id": entry["id"], "name": name}
                     if ns:
                         item["namespace"] = ns
-                    if is_custom:
+                    if entry["custom"]:
                         item["type"] = "custom_tool_call"
                         item["input"] = ""
                     else:
                         item["type"] = "function_call"
                         item["arguments"] = ""
                     yield ev("response.output_item.added",
-                             {"output_index": out_idx, "item": item})
-                else:
-                    if fn_name and not entry.get("wire"):
-                        entry["wire"] = fn_name
-                        if fn_name in custom_names:
-                            entry["custom"] = True
+                             {"output_index": entry["output_index"],
+                              "item": item})
+                    if not entry["custom"] and entry["arguments"]:
+                        # name 晚于参数到达：补发此前攒下的参数，保证客户端
+                        # 把 delta 拼起来就是完整 arguments。
+                        yield ev("response.function_call_arguments.delta", {
+                            "output_index": entry["output_index"],
+                            "item_id": entry["item_id"],
+                            "call_id": entry["id"],
+                            "delta": entry["arguments"],
+                        })
                 if fn_args:
                     entry["arguments"] += fn_args
                     # custom 工具的参数是 JSON 包装的原始 payload：逐片透传
                     # 会让客户端看到 {"input": ...} 外壳，转义也可能跨片。
                     # 攒到收尾时一次性发解包后的完整文本（见下方收尾循环）。
-                    if not entry.get("custom"):
+                    if entry["announced"] and not entry["custom"]:
                         yield ev("response.function_call_arguments.delta", {
                             "output_index": entry["output_index"],
                             "item_id": entry["item_id"],
@@ -4956,6 +5040,16 @@ def stream_responses_events(inner_lines, model, holder):
                             break
             if choice.get("finish_reason"):
                 finish = choice["finish_reason"]
+    truncated = finish == "length"
+    if any(not e.get("announced") for e in tool_calls_map.values()):
+        # 上游给了一个始终没有名字的工具调用：明确失败，不产出空名工具。
+        yield ev("response.failed", {
+            "response": dict(resp_obj("failed"), error={
+                "code": "invalid_tool_call",
+                "message": "upstream returned a tool call without a name",
+            }),
+        })
+        return
     if reason_index is not None and outputs[reason_index] is None:
         full_r = "".join(reason_parts)
         yield ev("response.reasoning_summary_text.done", {
@@ -4974,40 +5068,46 @@ def stream_responses_events(inner_lines, model, holder):
     for idx in sorted(tool_calls_map.keys()):
         entry = tool_calls_map[idx]
         name, ns = _responses_item_name(entry.get("wire"), tool_wire)
+        # finish_reason=length 且参数不是完整 JSON：这是被截断的调用。标
+        # incomplete 且不发 .done —— 不把残缺 payload 冒充可执行结果。
+        complete = _tool_payload_complete(entry["arguments"])
+        status = "incomplete" if (truncated and not complete) else "completed"
         if entry.get("custom"):
             payload_text = _custom_input_text(entry["arguments"])
-            if payload_text:
-                yield ev("response.custom_tool_call_input.delta", {
+            if status == "completed":
+                if payload_text:
+                    yield ev("response.custom_tool_call_input.delta", {
+                        "output_index": entry["output_index"],
+                        "item_id": entry["item_id"],
+                        "call_id": entry["id"],
+                        "delta": payload_text,
+                    })
+                yield ev("response.custom_tool_call_input.done", {
                     "output_index": entry["output_index"],
                     "item_id": entry["item_id"],
                     "call_id": entry["id"],
-                    "delta": payload_text,
+                    "input": payload_text,
                 })
-            yield ev("response.custom_tool_call_input.done", {
-                "output_index": entry["output_index"],
-                "item_id": entry["item_id"],
-                "call_id": entry["id"],
-                "input": payload_text,
-            })
             fc_item = {
                 "id": entry["item_id"],
                 "type": "custom_tool_call",
-                "status": "completed",
+                "status": status,
                 "call_id": entry["id"],
                 "name": name,
                 "input": payload_text,
             }
         else:
-            yield ev("response.function_call_arguments.done", {
-                "output_index": entry["output_index"],
-                "item_id": entry["item_id"],
-                "call_id": entry["id"],
-                "arguments": entry["arguments"],
-            })
+            if status == "completed":
+                yield ev("response.function_call_arguments.done", {
+                    "output_index": entry["output_index"],
+                    "item_id": entry["item_id"],
+                    "call_id": entry["id"],
+                    "arguments": entry["arguments"],
+                })
             fc_item = {
                 "id": entry["item_id"],
                 "type": "function_call",
-                "status": "completed",
+                "status": status,
                 "call_id": entry["id"],
                 "name": name,
                 "arguments": entry["arguments"],
@@ -5074,13 +5174,17 @@ def stream_responses_events(inner_lines, model, holder):
         for dc in dsml_calls:
             out_idx = len(outputs)
             name, ns = _responses_item_name(dc.get("name") or "", tool_wire)
+            dsml_args = dc.get("arguments") or "{}"
+            dsml_status = ("incomplete"
+                           if truncated and not _tool_payload_complete(dsml_args)
+                           else "completed")
             fc_item = {
                 "id": _new_id("fc_"),
                 "type": "function_call",
-                "status": "completed",
+                "status": dsml_status,
                 "call_id": dc.get("id") or _new_id("call_"),
                 "name": name,
-                "arguments": dc.get("arguments") or "{}",
+                "arguments": dsml_args,
             }
             if ns:
                 fc_item["namespace"] = ns
@@ -5095,12 +5199,13 @@ def stream_responses_events(inner_lines, model, holder):
                 "call_id": fc_item["call_id"],
                 "delta": fc_item["arguments"],
             })
-            yield ev("response.function_call_arguments.done", {
-                "output_index": out_idx,
-                "item_id": fc_item["id"],
-                "call_id": fc_item["call_id"],
-                "arguments": fc_item["arguments"],
-            })
+            if dsml_status == "completed":
+                yield ev("response.function_call_arguments.done", {
+                    "output_index": out_idx,
+                    "item_id": fc_item["id"],
+                    "call_id": fc_item["call_id"],
+                    "arguments": fc_item["arguments"],
+                })
             yield ev("response.output_item.done",
                      {"output_index": out_idx, "item": fc_item})
     # 3. 有文本或没有任何输出项时，补 message 项

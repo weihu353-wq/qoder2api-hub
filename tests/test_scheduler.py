@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import types
 import unittest
@@ -130,35 +131,47 @@ class Stub(object):
         self.always_fail = set()   # uid -> 永远失败
         self.already = set()       # uid -> 已领取（不落窗口戳）
         self.on_batch = None
+        self.active_batches = 0    # 并发批次数（防双 worker 探针）
+        self.max_active_batches = 0
 
     def batch(self, targets, gap=1.0, inter_gap=1.0):
         self.batch_calls.append([a.uid for a in targets])
-        if self.on_batch:
-            self.on_batch(self)
-        logs = []
-        total = 0
-        any_ok = False
-        for acc in targets:
-            if acc.uid in self.always_fail:
-                logs.append("! [%s] 签到失败: simulated permanent error" % acc.uid)
-                continue
-            remaining = self.fail_counts.get(acc.uid, 0)
-            if remaining > 0:
-                self.fail_counts[acc.uid] = remaining - 1
-                logs.append("! [%s] 签到失败: simulated transient error" % acc.uid)
-                continue
-            if acc.uid in self.already:
+        self.active_batches += 1
+        self.max_active_batches = max(self.max_active_batches,
+                                      self.active_batches)
+        try:
+            if self.on_batch:
+                self.on_batch(self)
+            logs = []
+            total = 0
+            any_ok = False
+            for acc in targets:
+                if acc.uid in self.always_fail:
+                    logs.append("! [%s] 签到失败: simulated permanent error"
+                                % acc.uid)
+                    continue
+                remaining = self.fail_counts.get(acc.uid, 0)
+                if remaining > 0:
+                    self.fail_counts[acc.uid] = remaining - 1
+                    logs.append("! [%s] 签到失败: simulated transient error"
+                                % acc.uid)
+                    continue
+                if acc.uid in self.already:
+                    any_ok = True
+                    logs.append("✓ [%s] 今日活动奖励已领取" % acc.uid)
+                    continue
+                # 与 Account._stamp_checkin 同构：展示时间戳 + 显式窗口日
+                acc.last_checkin = time.strftime("%Y-%m-%d %H:%M:%S")
+                acc.last_checkin_window = SCH.window_day(self.clock())
+                total += 100
                 any_ok = True
-                logs.append("✓ [%s] 今日活动奖励已领取" % acc.uid)
-                continue
-            # 与 Account._stamp_checkin 同构：展示时间戳 + 显式窗口日
-            acc.last_checkin = time.strftime("%Y-%m-%d %H:%M:%S")
-            acc.last_checkin_window = SCH.window_day(self.clock())
-            total += 100
-            any_ok = True
-            logs.append("✓ [%s] 签到成功 +100 积分" % acc.uid)
-        return {"ok": any_ok, "logs": logs, "credit_added": total,
-                "accounts_count": len(targets)}
+                logs.append("✓ [%s] 签到成功 +100 积分" % acc.uid)
+        finally:
+            self.active_batches -= 1
+        # run_batch_checkin 会给每个账号的日志加两空格前缀；桩保持同样形状，
+        # 顺带锁住「调度器必须先 lstrip 才能识别 ✓/!」这一行为。
+        return {"ok": any_ok, "logs": ["  " + line for line in logs],
+                "credit_added": total, "accounts_count": len(targets)}
 
     def keepalive(self, pool, force=False, threshold_seconds=4 * 3600):
         self.keepalive_calls.append(bool(force))
@@ -209,7 +222,19 @@ class SchedulerTestCase(unittest.TestCase):
             if isinstance(acc, FakeAccount) and acc._clock is None:
                 acc._clock = self.clock
         pool = FakePool(accounts, self.tmp)
-        return SCH.Scheduler(pool, state_dir=self.tmp, now_fn=self.clock, **kwargs)
+        sched = SCH.Scheduler(pool, state_dir=self.tmp, now_fn=self.clock,
+                              **kwargs)
+        self.addCleanup(self._shutdown_scheduler, sched)
+        return sched
+
+    @staticmethod
+    def _shutdown_scheduler(sched):
+        """用例收尾：停 worker、join 交接线程，避免线程跨用例污染。"""
+        sched.stop()
+        if sched._restart_thread:
+            sched._restart_thread.join(timeout=5)
+        if sched._thread:
+            sched._thread.join(timeout=5)
 
     def state(self):
         path = os.path.join(self.tmp, "scheduler", "state.json")
@@ -508,8 +533,10 @@ class RealAccountTests(SchedulerTestCase):
     def test_legacy_timestamp_only_account_still_works(self):
         # 老账号只有 lastCheckin（无窗口字段）：按旧宿主时区推导活动窗口
         self.use_account_clock()
+        legacy_stamp = datetime.datetime.fromtimestamp(
+            bj_epoch(2026, 10, 7, 9, 0)).strftime("%Y-%m-%d %H:%M:%S")
         acc = A.Account({"uid": "u2", "accessToken": "tok",
-                         "lastCheckin": "2026-10-07 09:00:00"})
+                         "lastCheckin": legacy_stamp})
         self.clock.set(bj_epoch(2026, 10, 7, 9, 30))
         self.assertFalse(acc.can_checkin())
         self.clock.set(bj_epoch(2026, 10, 7, 10, 30))
@@ -647,6 +674,191 @@ class LoopTests(SchedulerTestCase):
         self.assertTrue(any("处于暂停状态" in line for line in sched.logs))
 
 
+class LifecycleTests(SchedulerTestCase):
+    """stop() -> start() 交接：proxy restart_scheduler 的 P1 回归。
+
+    旧实现：stop() 只置位，start() 见旧 worker 还活着就 return；旧 worker 随后
+    退出，于是没有任何 worker 接手——调度器静默死亡。这里锁住正确语义：旧
+    worker 未退出前绝不起新 worker、也不清共享 stop 事件；退出后再交接。
+    """
+
+    def setUp(self):
+        super(LifecycleTests, self).setUp()
+        self._saved_loop = (SCH.STARTUP_DELAY_SECONDS, SCH.POLL_SECONDS,
+                            SCH.HOUR_DEDUP_SECONDS)
+        SCH.STARTUP_DELAY_SECONDS = 0.01
+        SCH.POLL_SECONDS = 0.02
+        SCH.HOUR_DEDUP_SECONDS = 0.02
+        self.addCleanup(self._restore_loop)
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def _restore_loop(self):
+        (SCH.STARTUP_DELAY_SECONDS, SCH.POLL_SECONDS,
+         SCH.HOUR_DEDUP_SECONDS) = self._saved_loop
+
+    def _start_and_block_in_batch(self):
+        """起 worker 并让它卡在批内：模拟 stop() 到达时旧 worker 还没退出。"""
+        def slow(stub):
+            self.entered.set()
+            self.release.wait(5)
+        self.stub.on_batch = slow
+        sched = self.make([FakeAccount("a1")])
+        sched.start()
+        self.assertTrue(self.entered.wait(5), sched.logs)
+        return sched
+
+    def _release_batch(self):
+        self.release.set()
+        self.stub.on_batch = None
+
+    @staticmethod
+    def _live_worker_count():
+        """当前存活的调度 worker 数（worker 线程固定命名，便于识别双 worker）。"""
+        return len([t for t in threading.enumerate()
+                    if t.name == "qd-scheduler" and t.is_alive()])
+
+    def test_restart_after_stop_starts_a_fresh_worker(self):
+        sched = self._start_and_block_in_batch()
+        first = sched._thread
+        sched.stop()
+        sched.start()                       # 旧 worker 仍在批内
+        self.assertTrue(sched.status()["restarting"])
+        self.assertIs(sched._thread, first)  # 旧 worker 未退，绝不提前起新的
+        self.assertTrue(first.is_alive())
+        self._release_batch()
+        self.assertTrue(wait_until(
+            lambda: sched._thread is not first and sched.worker_running(), 5),
+            sched.logs)
+        self.assertFalse(first.is_alive())   # 先退出旧 worker 再交接
+        self.assertFalse(sched.status()["restarting"])
+        self.assertTrue(sched.status()["running"])
+
+    def test_restart_never_leaves_scheduler_dead(self):
+        sched = self._start_and_block_in_batch()
+        first = sched._thread
+        sched.stop()
+        sched.start()
+        self._release_batch()
+        # 等交接真正完成：旧 worker 退出、新 worker 顶上来（不是「旧的还活着」）
+        self.assertTrue(wait_until(
+            lambda: sched._thread is not first and sched.worker_running(), 5),
+            sched.logs)
+        self.assertIsNot(sched._thread, first)
+        self.assertFalse(first.is_alive())
+
+    def test_stop_cancels_queued_restart(self):
+        sched = self._start_and_block_in_batch()
+        first = sched._thread
+        sched.stop()
+        sched.start()                       # 排队重启
+        sched.stop()                        # 排队期间再次 stop -> 取消
+        self._release_batch()
+        first.join(timeout=5)
+        self.assertTrue(wait_until(lambda: not sched.restart_pending(), 5))
+        self.assertFalse(sched.worker_running())     # 没有起新 worker
+        self.assertIs(sched._thread, first)
+        self.assertTrue(any("已被 stop() 取消" in line for line in sched.logs))
+
+    def test_repeated_restarts_coalesce_into_one_worker(self):
+        self.stub.already = {"a1"}          # 一直待签，便于观察 worker 行为
+        sched = self._start_and_block_in_batch()
+        first = sched._thread
+        for _ in range(3):
+            sched.stop()
+            sched.start()
+        self.assertTrue(sched.status()["restarting"])
+        self.assertIs(sched._thread, first)
+        self._release_batch()
+        self.assertTrue(wait_until(
+            lambda: sched._thread is not first and sched.worker_running(), 5),
+            sched.logs)
+        second = sched._thread
+        time.sleep(0.3)
+        self.assertIs(sched._thread, second)         # 不会冒出第二个 worker
+        self.assertFalse(sched.status()["restarting"])
+        self.assertLessEqual(self.stub.max_active_batches, 1)  # 无双 worker 并发
+        self.assertEqual(self._live_worker_count(), 1)
+
+    def test_second_start_during_handoff_does_not_double_spawn(self):
+        """旧 worker 已退出、交接线程尚未拿到生命周期锁时的第二次 start()。"""
+        self.stub.already = {"a1"}          # 保持待签，便于观察 worker 数量
+        sched = self._start_and_block_in_batch()
+        first = sched._thread
+        sched.stop()
+        sched.start()                       # 排队交接：helper 正在 join 旧 worker
+        # 抢在 helper 之前握住生命周期锁：旧 worker 退出后 helper 会卡在锁上，
+        # 精确复现「old 已退、helper 尚未接管」的窗口。
+        sched._lifecycle_lock.acquire()
+        try:
+            self._release_batch()
+            first.join(timeout=5)
+            time.sleep(0.2)
+            self.assertTrue(sched.status()["restarting"])
+            sched.start()                   # 关键：helper 尚未接管时的第二次 start()
+            self.assertIs(sched._thread, first)   # 绝不在 helper 之前另起 worker
+        finally:
+            sched._lifecycle_lock.release()
+        self.assertTrue(wait_until(
+            lambda: sched._thread is not first and sched.worker_running(), 5),
+            sched.logs)
+        second = sched._thread
+        time.sleep(0.3)
+        self.assertIs(sched._thread, second)          # 只有一个新 worker
+        self.assertEqual(self._live_worker_count(), 1)  # 不制造双 worker
+
+    def test_start_while_running_is_noop(self):
+        sched = self.make([FakeAccount("a1")])
+        sched.start()
+        self.assertTrue(wait_until(sched.worker_running, 5))
+        first = sched._thread
+        sched.start()
+        self.assertIs(sched._thread, first)
+        self.assertFalse(sched.status()["restarting"])
+
+    def test_stop_then_start_without_live_worker_spawns_immediately(self):
+        sched = self.make([FakeAccount("a1")])
+        sched.stop()
+        sched.start()
+        self.assertTrue(sched.worker_running())
+        self.assertFalse(sched.restart_pending())
+
+    def test_stop_after_restart_pauses_the_new_worker(self):
+        sched = self._start_and_block_in_batch()
+        first = sched._thread
+        sched.stop()
+        sched.start()
+        self._release_batch()
+        self.assertTrue(wait_until(
+            lambda: sched._thread is not first and sched.worker_running(), 5),
+            sched.logs)
+        second = sched._thread
+        sched.stop()
+        self.assertTrue(wait_until(lambda: not second.is_alive(), 5))
+        self.assertFalse(sched.worker_running())
+
+
+class LogSurfaceTests(SchedulerTestCase):
+    """run_batch_checkin 的账号行带两空格前缀，调度器必须先 lstrip 再识别。"""
+
+    def test_indented_success_line_is_surfaced(self):
+        acc = FakeAccount("a1")
+        sched = self.make([acc])
+        self.cycle(sched, SCH.CYCLE_MANUAL)
+        self.assertTrue(any("签到成功" in line for line in sched.logs),
+                        sched.logs)
+        self.assertTrue(any("✓" in line for line in sched.logs), sched.logs)
+
+    def test_indented_failure_line_is_surfaced(self):
+        os.environ["QD_CHECKIN_MAX_ATTEMPTS"] = "1"
+        os.environ["QD_CHECKIN_RETRY_BACKOFF"] = "0"
+        acc = FakeAccount("a1")
+        self.stub.always_fail = {"a1"}
+        sched = self.make([acc])
+        self.cycle(sched, SCH.CYCLE_MANUAL)
+        self.assertTrue(any("签到失败" in line for line in sched.logs),
+                        sched.logs)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
-

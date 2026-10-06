@@ -39,6 +39,9 @@
     一律不重复。
   · 执行生命周期可取消：stop() 后循环退出；巡检在各阶段/重试之间检查取消，
     退避等待可被 stop 立即唤醒。
+  · 生命周期交接：stop() 紧跟 start()（proxy 的 restart_scheduler）不会清掉
+    共享 stop 事件造成双 worker，也不会静默死亡——交给去重的交接线程，先
+    join 旧 worker 再起新 worker；排队期间再 stop() 会取消这次重启。
   · 只读安全：status()/状态读取不触发任何签到或刷新。
 
 状态落盘：enabled / 开关 / 小时 / last_run_time / next_run_time / logs /
@@ -138,6 +141,13 @@ class Scheduler(object):
         self._stop_event = threading.Event()
         self._thread = None
         self._run_lock = threading.Lock()
+        # 生命周期：stop() 紧跟 start() 的重启必须等旧 worker 真正退出再起新的，
+        # 否则清掉共享 stop 事件会让旧 worker 继续跑（双 worker）或无人接手
+        # （旧 worker 退出后调度器静默死亡）。_desired_running 记录最后一次
+        # start()/stop() 的意图，供交接线程判断排队中的重启是否已被取消。
+        self._lifecycle_lock = threading.RLock()
+        self._restart_thread = None
+        self._desired_running = False
         # 状态目录：优先显式传入（测试）→ 账号池目录 → 环境变量 → 脚本同级 accounts/
         self.state_dir = (state_dir or getattr(pool, "dir", None)
                           or os.environ.get("ACCOUNTS_DIR")
@@ -357,16 +367,76 @@ class Scheduler(object):
 
     # -- 生命周期 -----------------------------------------------------------
     def start(self):
-        if self._thread and self._thread.is_alive():
-            return
+        """启动后台 worker；旧 worker 还没退出时排队交接后再起新的。
+
+        proxy 的 restart_scheduler 是 stop() 紧跟 start()：旧 worker 可能正在
+        批内执行，stop() 只置位、它还没退出。此时**不能**清共享 stop 事件
+        （旧 worker 会继续跑，形成双 worker），也不能直接返回（旧 worker 退出
+        后没人接手，调度器静默死亡）。正确做法是交给一个去重的交接线程：
+        先 join 旧 worker，再清事件、起新 worker。
+        """
+        with self._lifecycle_lock:
+            self._desired_running = True
+            # 已有交接线程在等旧 worker 退出：一律交给它。否则「旧 worker 刚
+            # 退出、helper 还没拿到锁」时这里会抢先起一个 worker，随后 helper
+            # 再起一个 -> 双 worker。
+            if self._restart_thread and self._restart_thread.is_alive():
+                self.log("调度器重启已排队，start() 合并到同一交接线程")
+                return
+            worker = self._thread
+            if worker and worker.is_alive():
+                if not self._stop_event.is_set():
+                    return                  # 正常运行中：保持原 no-op 语义
+                helper = threading.Thread(target=self._handoff_restart,
+                                          args=(worker,),
+                                          name="qd-scheduler-restart",
+                                          daemon=True)
+                self._restart_thread = helper
+                helper.start()
+                self.log("旧调度线程尚未退出，已排队重启交接")
+                return
+            self._spawn_worker_locked()
+
+    def stop(self):
+        with self._lifecycle_lock:
+            self._desired_running = False
+            self._stop_event.set()
+        self.log("后台定时调度器已暂停")
+
+    def _spawn_worker_locked(self):
+        """（调用方须持有 _lifecycle_lock）清 stop 事件并起一个全新 worker。"""
         self._stop_event.clear()
-        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._thread = threading.Thread(target=self._run_loop,
+                                        name="qd-scheduler", daemon=True)
         self._thread.start()
         self.log("后台定时调度器已启动")
 
-    def stop(self):
-        self._stop_event.set()
-        self.log("后台定时调度器已暂停")
+    def _handoff_restart(self, worker):
+        """交接线程：等旧 worker 退出；期间又被 stop() 取消则不再起新 worker。"""
+        try:
+            if worker is not threading.current_thread():
+                worker.join()
+        except Exception:
+            pass
+        with self._lifecycle_lock:
+            self._restart_thread = None
+            # 交接期间若有别的 start() 已经起过 worker（self._thread 被替换），
+            # 这里不能再起第二个；只有仍指向我们 join 的那个旧 worker 时才接手。
+            if self._thread is not worker:
+                self.log("重启交接已被其他 start() 接管，跳过重复启动")
+                return
+            if not self._desired_running:
+                self.log("排队中的调度器重启已被 stop() 取消")
+                return
+            self._spawn_worker_locked()
+
+    def worker_running(self):
+        """只读：是否有存活的自动巡检 worker。"""
+        return bool(self._thread and self._thread.is_alive())
+
+    def restart_pending(self):
+        """只读：是否有排队中的重启交接线程。"""
+        return bool(self._restart_thread and self._restart_thread.is_alive())
 
     def set_enabled(self, value):
         """看板开关入口（兼容旧写法：直接改 enabled 属性亦可）。"""
@@ -613,8 +683,11 @@ class Scheduler(object):
             earned += res.get("credit_added") or 0
             failure = self._batch_has_failure(res)
             for line in res.get("logs") or []:
-                if line.startswith("✓") or line.startswith("!"):
-                    self.log(line)
+                # run_batch_checkin 给每个账号的日志加了两空格前缀，
+                # 直接 startswith 匹配不到，必须先 lstrip。
+                stripped = str(line).lstrip()
+                if stripped.startswith("✓") or stripped.startswith("!"):
+                    self.log(stripped)
             remaining = [a for a in current if self._needs_checkin(a)]
             if not remaining:
                 break
@@ -665,8 +738,9 @@ class Scheduler(object):
                  % (ka["refreshed"], ka["failed"],
                     "（保活窗口集中刷新）" if force else "（临近过期）"))
         for line in ka["logs"]:
-            if line.startswith("!"):
-                self.log(line)
+            stripped = str(line).lstrip()
+            if stripped.startswith("!"):
+                self.log(stripped)
 
         # 2. 每日签到：自动开关（手动触发始终执行）。各巡回来由都只针对
         #    「本窗口还没签」的账号——can_checkin()/显式窗口字段是权威，
@@ -715,6 +789,8 @@ class Scheduler(object):
             "enabled": self.enabled,
             "effective_enabled": self.effective_enabled,
             "paused_by_env": self._enabled_override is False,
+            "running": self.worker_running(),
+            "restarting": self.restart_pending(),
             "auto_checkin": self.auto_checkin,
             "auto_quota_refresh": self.auto_quota_refresh,
             "checkin_hours": list(self.checkin_hours),

@@ -7,11 +7,14 @@ import copy
 import http.client
 import io
 import json
+from pathlib import Path
+import sys
 import threading
 from types import SimpleNamespace
 import unittest
 from unittest import mock
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import qoder_proxy as proxy
 
 
