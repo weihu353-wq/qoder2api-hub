@@ -37,6 +37,7 @@ import socket
 import ssl
 import sys
 import threading
+import fnmatch
 import time
 import urllib.error
 import urllib.parse
@@ -44,6 +45,7 @@ import urllib.request
 import uuid
 
 import qoder_accounts
+import qoder_anthropic
 import qoder_catalog
 import qoder_settings
 import qoder_sign
@@ -54,9 +56,43 @@ from pathlib import Path
 
 # 个人维护版标识：-codex.N 后缀区分本 fork 与上游同基线版本，
 # 便于 /health、Server header 与日志识别当前跑的是哪一份构建。
-VERSION = "1.2.17-codex.1"
+VERSION = "1.3.4-codex.1"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
+
+
+def is_model_banned(model):
+    """P1-4：True = 该模型在本机被全局封禁，不送去上游。
+
+    配置源：settings 的 banned_models（fnmatch pattern 列表，默认空 = 不封禁）。
+    读配置失败一律 fail-open（不误封）。与 wb 的差异：配置在 settings 而非代码
+    常量——本仓已有面板/设置机制。
+    """
+    name = str(model or "").strip().lower()
+    if not name:
+        return False
+    try:
+        patterns = qoder_settings.banned_models(ACCOUNTS_DIR)
+    except Exception:
+        return False
+    return any(fnmatch.fnmatchcase(name, p) for p in patterns)
+
+
+def banned_model_message(model):
+    """封禁模型的本机拒绝文案（完全不碰上游）。"""
+    return ("模型 %s 已被本机网关封禁（settings 的 banned_models 配置）。"
+            "如需使用，请在设置页或 settings.json 里调整 banned_models。"
+            % model)
+
+
+def key_model_message(entry, model):
+    """每 Key 模型限制的拒绝文案（与全局封禁同风格）。"""
+    name = (entry or {}).get("name") or "未命名"
+    allowed = "、".join((entry or {}).get("models") or []) or "-"
+    asked = str(model or "").strip() or "(未指定模型)"
+    return ("API Key「%s」的模型限制不允许 %s。该 Key 目前允许：%s。"
+            "请在设置页修改该 Key 的模型限制，或改用允许该模型的 Key。"
+            % (name, asked, allowed))
 
 
 # 198.18.0.0/15 (RFC 2544 benchmarking) 与 fdfe:dcba:9876::/48 被 Clash/mihomo
@@ -290,7 +326,10 @@ USAGE_SUMMARY = os.path.join(USAGE_DIR, "usage-summary.json")
 DASHBOARD_HTML = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               "dashboard.html")
 USAGE_FIELDS = ("prompt_tokens", "completion_tokens", "reasoning_tokens",
-                "cached_tokens", "total_tokens", "credit")
+                "cached_tokens", "total_tokens", "credit",
+                # issue #22：折扣时段对账要用的原价积分（数值，参与聚合）。
+                # billable 是布尔值，**不做聚合**、只写进 JSONL 行（见 _extract_usage）。
+                "original_credits")
 
 # Web-panel access control. The panel is gated by its own password (default
 # "admin"), independent of the /v1 API key. Sessions live in memory only.
@@ -330,7 +369,8 @@ def identify_key(supplied):
 def _empty_stats():
     return {"requests": 0, "errors": 0, "prompt_tokens": 0,
             "completion_tokens": 0, "reasoning_tokens": 0, "cached_tokens": 0,
-            "total_tokens": 0, "credit": 0.0, "started": time.time(),
+            "total_tokens": 0, "credit": 0.0, "original_credits": 0.0,
+            "started": time.time(),
             "by_model": {},
             "ttft_ms_sum": 0, "ttft_samples": 0,
             "gen_ms_sum": 0, "gen_samples": 0,
@@ -353,11 +393,30 @@ def _extract_usage(usage):
         "cached_tokens": usage.get("prompt_cache_hit_tokens")
         or details.get("cached_tokens") or prompt_details.get("cached_tokens") or 0,
         "total_tokens": usage.get("total_tokens") or 0,
-        "credit": usage.get("credit") or 0,
+        # issue #22：上游给的是**复数 credits** —— 旧实现只读单数 credit，
+        # 恒为 None -> 所有 usage 记录成 0（历史数据无法回填，原始值未落盘）。
+        # 保留单数兜底以兼容其它区域/版本的字段差异。
+        "credit": usage.get("credits") or usage.get("credit") or 0,
+        "original_credits": usage.get("original_credits") or 0,
+        # billable 只记录不聚合（布尔求和无意义）：进 JSONL 行，不进
+        # USAGE_FIELDS 的累加与 by_model。
+        "billable": bool(usage.get("billable")),
     }
 
 
+def realm_scope(value):
+    """面板 realm 取值的归一：显式 "all"（大小写不敏感）= 全部区域 → None（无过滤）。
+
+    只有字面 "all" 被当作通配：None / "" 本来就表示"无过滤"（各路由会先回落到
+    CURRENT_REALM 再传进来），"cn" / "intl" / 其它未知值**一律原样保留既有语义**
+    （按字面比较；未知值自然过滤出空集 —— 不在这里替面板猜意图）。
+    """
+    v = str(value if value is not None else "").strip()
+    return None if v.lower() in ("", "all") else v
+
+
 def row_matches_realm(row, realm):
+    realm = realm_scope(realm)
     if not realm:
         return True
     r = row.get("realm")
@@ -375,8 +434,17 @@ def row_matches_realm(row, realm):
 
 
 def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None,
-                 gen_ms=None, fp=None, account=None):
-    """Accumulate stats, append a JSONL row, and persist the summary."""
+                 gen_ms=None, fp=None, account=None, effort=None,
+                 effort_requested=None, key_id=None):
+    """Accumulate stats, append a JSONL row, and persist the summary.
+
+    P1-3（推理档位审计 + key 归属）：后三个参数都是**可选**的，旧调用路径不传
+    就一个键都不写 —— 行格式与改动前逐字节一致。
+      effort            实际下发给上游的档位（None = 本次没有下发该参数）
+      effort_requested  客户端请求的原始档位（归一化之前）
+      key_id            API key 的**标识**（panel id / legacy / launcher），不涉明文
+    请求档位与实际档位同时落盘，才能看出归一化有没有把它们改掉/丢掉。
+    """
     fields = _extract_usage(usage)
     if not fields:
         return None
@@ -394,6 +462,19 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None,
         row.update(fp)
     if account:
         row["account"] = account
+    # P1-3：推理档位审计（请求档位 vs 实际下发档位）与 API key 归属。
+    # 三者都是可选参数：不传则一个键都不写，旧行格式不变。
+    if effort_requested:
+        row["reasoning_effort_requested"] = str(effort_requested)
+    if effort:
+        row["reasoning_effort"] = str(effort)
+    elif effort_requested:
+        # 请求了档位但归一化后不下发（模型无档位表 / 被丢弃）：显式记空串，
+        # 便于区分「客户端没请求」与「请求了但没生效」两种情况。
+        row["reasoning_effort"] = ""
+    if key_id:
+        # 只记 key 的**标识**（panel 分配的 id / legacy / launcher），绝无明文 key。
+        row["key_id"] = str(key_id)
     acc = POOL.get(account) if (account and POOL) else None
     row["realm"] = acc.realm if acc else CURRENT_REALM
     if gen_ms and gen_ms > 0:
@@ -509,31 +590,100 @@ def _pct(values, q):
     return ordered[max(0, min(len(ordered) - 1, idx))]
 
 
+# ---------------------------------------------------------------------------
+# 时间窗口：?range=day|week|month|all|custom&since=&until=
+# ---------------------------------------------------------------------------
+# 语义（与面板选择器、wb 参考实现一致）：day/week/month 是**锚到本地零点**的日历
+# 窗口（week 从周一起算、month 从 1 号起算），custom 取面板传来的两个 epoch（任一端
+# 可缺省，反了自动交换），all / 空 / 未知值 = 不设窗口（历史全量）。返回 (since, until)，
+# None 表示该侧无界；两侧都 None 时下游**完全不做过滤**（_row_in_window 直接返回 True，
+# 连 at 都不读），因此不传 range 的输出与改动前逐字节一致。
+def _epoch_or_none(value):
+    """面板传来的 epoch 秒；负值/不可解析一律丢弃（不做钳制，宁可不设界）。"""
+    if value in (None, "", False):
+        return None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    return seconds if seconds >= 0 else None
+
+
+def _local_midnight(days_back=0):
+    lt = time.localtime(time.time() - days_back * 86400)
+    return time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1))
+
+
+def range_window(value, since=None, until=None):
+    v = str(value or "").strip().lower()
+    if v in ("today", "day", "1d"):
+        return _local_midnight(), None
+    if v in ("week", "w"):
+        return _local_midnight(days_back=time.localtime().tm_wday), None
+    if v in ("month", "m"):
+        lt = time.localtime()
+        return time.mktime((lt.tm_year, lt.tm_mon, 1, 0, 0, 0, 0, 0, -1)), None
+    if v == "custom":
+        lo, hi = _epoch_or_none(since), _epoch_or_none(until)
+        if lo is not None and hi is not None and hi < lo:
+            lo, hi = hi, lo
+        return lo, hi
+    return None, None
+
+
+def range_query(query):
+    """从 parse_qs 的查询串里取 (range, since, until)；缺省一律 None。"""
+    def first(name):
+        values = query.get(name) or [None]
+        return values[0] if values else None
+    return first("range"), first("since"), first("until")
+
+
+def _row_in_window(row, since, until):
+    """窗口过滤：两侧都 None 时不做任何读取（老路径零开销、零差异）。"""
+    if since is None and until is None:
+        return True
+    at = row.get("at")
+    if not isinstance(at, (int, float)):
+        at = 0
+    if since is not None and at < since:
+        return False
+    if until is not None and at > until:
+        return False
+    return True
+
+
 _perf_cache = {}
 _perf_lock = threading.Lock()
 
 
-def perf_stats(sample=5000, realm=None, ttl=10):
+def perf_stats(sample=5000, realm=None, ttl=10, range=None, since=None, until=None):
     """Cached wrapper: parsing thousands of rows is CPU-heavy, and the
     dashboard polls this endpoint every few seconds."""
     r = realm or CURRENT_REALM
+    lo, hi = range_window(range, since, until)
     try:
-        key = (int(sample), r)
+        # 缓存键带上**解析后的边界**（不是 range 标签）：week 与 month 相互重叠，
+        # 一个标签无法描述两个窗口，否则会拿一个窗口的数据冒充另一个。
+        key = (int(sample), r, lo, hi)
     except Exception:
-        key = (5000, r)
+        key = (5000, r, lo, hi)
     now = time.time()
     with _perf_lock:
         hit = _perf_cache.get(key)
         if hit is not None and (now - hit[0]) < ttl:
             return hit[1]
-    data = _perf_stats_uncached(sample, realm)
+    data = _perf_stats_uncached(sample, realm, since=lo, until=hi)
     with _perf_lock:
         _perf_cache[key] = (time.time(), data)
     return data
 
 
-def _perf_stats_uncached(sample=5000, realm=None):
-    """Latency percentiles + derived rates, computed from the JSONL log."""
+def _perf_stats_uncached(sample=5000, realm=None, since=None, until=None):
+    """Latency percentiles + derived rates, computed from the JSONL log.
+
+    since/until 为窗口边界（None=该侧无界）；两者都 None 时行为与改动前一致。
+    """
     ttfts, gens, walls, rates, hits, tok_rates = [], [], [], [], [], []
     total = ok = err = 0
     m_buckets = {}
@@ -548,6 +698,8 @@ def _perf_stats_uncached(sample=5000, realm=None):
         except Exception:
             continue
         if realm and not row_matches_realm(r, realm):
+            continue
+        if not _row_in_window(r, since, until):
             continue
         total += 1
         if r.get("error"):
@@ -739,6 +891,7 @@ def _tail_lines(path, max_lines, chunk=256 * 1024):
 
 def count_usage_rows(realm=None):
     """Cheap row count - substring match instead of a full JSON parse."""
+    realm = realm_scope(realm)      # realm=all 走无 needles 分支，与逐行过滤一致
     needles = ()
     if realm:
         needles = ('"realm": "%s"' % realm, '"realm":"%s"' % realm)
@@ -885,25 +1038,78 @@ def account_views(realm=None):
     return POOL.list_public(realm=realm)
 
 
-_byacct_cache = {"at": 0.0, "data": None}
+_CREDITS_SUMMARY_NOTE = ("registered values only; freshness depends on "
+                         "check-in and consumption write-back")
+
+# 按**解析后的窗口边界**分键：(since, until) -> (at, data)。week/month 相互重叠，
+# 一个"范围标签"键会让一个窗口的数据冒充另一个（见 range_window 的注释）。
+_byacct_cache = {}
 _byacct_lock = threading.Lock()
+# P1-3 收尾：按 key 聚合用**同形状**的缓存（同 key 口径：解析后的窗口边界）
+_bykey_cache = {}
+_bykey_lock = threading.Lock()
 
 
-def usage_by_account(ttl=10):
+def credits_summary():
+    """issue #21：只读积分汇总（**绝不触发上游查询**）。
+
+    数据源是 accounts/*.json 里**已登记**的 credits（fetch_credits 写入 +
+    每次消耗回写）；同宿主机轮询方（API Pool 面板）用它替代裸读目录文件。
+    与 /accounts/credits 的区别：那个会逐号强刷上游，只适合手动点击 ——
+    本函数一次网络调用都不发。
+
+    防御：POOL 为 None / 列表为空 / 账号没有 credits（新号还没登过）/
+    credits 结构残缺 —— 都只影响该行取值（None）与它是否计入汇总，
+    绝不抛异常、绝不 500。
+    """
+    by_realm = {}
+    rows = []
+    total_remain = 0
+    accounts = list(POOL.accounts) if POOL else []
+    for a in accounts:
+        cred = getattr(a, "credits", None)
+        if not isinstance(cred, dict):
+            cred = {}
+        realm = getattr(a, "realm", "") or ""
+        remain = cred.get("remain")
+        rows.append({
+            "uid": getattr(a, "uid", "") or "",
+            "nickname": getattr(a, "nickname", "") or "",
+            "realm": realm,
+            "credits_remain": remain,
+            "credits_used": cred.get("used"),
+            "credits_size": cred.get("size"),
+            # 登记时间：credits.updated_at（fetch_credits 写入），不是文件 mtime。
+            "registered_at": cred.get("updated_at"),
+        })
+        if isinstance(remain, (int, float)) and not isinstance(remain, bool):
+            by_realm[realm] = by_realm.get(realm, 0) + int(remain)
+            total_remain += int(remain)
+    return {
+        "by_realm": by_realm,
+        "totals": {"remain": total_remain, "accounts": len(rows)},
+        "accounts": rows,
+        "note": _CREDITS_SUMMARY_NOTE,
+    }
+
+
+def usage_by_account(ttl=10, range=None, since=None, until=None):
     """Cached wrapper: full aggregation over the whole log is expensive."""
+    lo, hi = range_window(range, since, until)
     now = time.time()
+    key = (lo, hi)
     with _byacct_lock:
-        if _byacct_cache["data"] is not None and (now - _byacct_cache["at"]) < ttl:
-            return _byacct_cache["data"]
-    data = _usage_by_account_uncached()
+        hit = _byacct_cache.get(key)
+        if hit is not None and (now - hit[0]) < ttl:
+            return hit[1]
+    data = _usage_by_account_uncached(since=lo, until=hi)
     with _byacct_lock:
-        _byacct_cache["at"] = time.time()
-        _byacct_cache["data"] = data
+        _byacct_cache[key] = (time.time(), data)
     return data
 
 
-def _usage_by_account_uncached():
-    """Aggregate the JSONL log per account id."""
+def _usage_by_account_uncached(since=None, until=None):
+    """Aggregate the JSONL log per account id（可选窗口过滤）。"""
     buckets = {}
     try:
         with open(USAGE_LOG, encoding="utf-8") as fh:
@@ -916,6 +1122,8 @@ def _usage_by_account_uncached():
                 except Exception:
                     continue
                 if row.get("error"):
+                    continue
+                if not _row_in_window(row, since, until):
                     continue
                 key = row.get("account") or "(unattributed)"
                 bucket = buckets.setdefault(key, {
@@ -940,10 +1148,202 @@ def _usage_by_account_uncached():
     return out
 
 
-def compute_usage_analytics():
-    """Detailed analytics for Token, Cache, and Reasoning metrics page."""
+def usage_by_key(ttl=10, range=None, since=None, until=None):
+    """Cached wrapper：与 usage_by_account 同缓存 key、同 TTL、同窗口解析。"""
+    lo, hi = range_window(range, since, until)
+    now = time.time()
+    key = (lo, hi)
+    with _bykey_lock:
+        hit = _bykey_cache.get(key)
+        if hit is not None and (now - hit[0]) < ttl:
+            return hit[1]
+    data = _usage_by_key_uncached(since=lo, until=hi)
+    with _bykey_lock:
+        _bykey_cache[key] = (time.time(), data)
+    return data
+
+
+def _usage_by_key_uncached(since=None, until=None):
+    """Aggregate the JSONL log per API key id（可选窗口过滤）。
+
+    P1-3 收尾：与 _usage_by_account_uncached **逐行同判**——同一套
+    _row_in_window 过滤、同一套「error 行跳过」规则、同样的字段与排序，
+    只把分桶键从 account 换成 key_id。因此两个视图在同一 range 下：
+        sum(by_key.total_tokens) == sum(by_account.total_tokens)
+    （这条不变量可直接当作「同源」的回归断言。）
+
+    注意：
+      - 缺 key_id 的行（P1-3 字段上线前的历史行、未带 key 的面板会话）归入
+        "(no-key)" 桶，**不静默丢弃**——丢弃会让「按 key 求和」小于总量；
+      - 只读本地 usage.jsonl，**不触发任何上游调用**；
+      - credit / original_credits 是 USAGE_FIELDS 的既有成员（by-account 目前
+        只累 token），这里一并累上：同名数字字段的算法与 by-account 完全一致，
+        属**字段超集**，不会让两个视图的数字对不上。
+    """
+    buckets = {}
+    try:
+        with open(USAGE_LOG, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                if row.get("error"):
+                    continue
+                if not _row_in_window(row, since, until):
+                    continue
+                key = row.get("key_id") or "(no-key)"
+                bucket = buckets.setdefault(key, {
+                    "key_id": key, "requests": 0, "prompt_tokens": 0,
+                    "completion_tokens": 0, "reasoning_tokens": 0,
+                    "cached_tokens": 0, "total_tokens": 0,
+                    "credit": 0.0, "original_credits": 0.0, "models": {},
+                })
+                bucket["requests"] += 1
+                for field in ("prompt_tokens", "completion_tokens",
+                              "reasoning_tokens", "cached_tokens",
+                              "total_tokens"):
+                    bucket[field] += row.get(field) or 0
+                bucket["credit"] += row.get("credit") or 0
+                bucket["original_credits"] += row.get("original_credits") or 0
+                model = row.get("model") or "?"
+                bucket["models"][model] = bucket["models"].get(model, 0) + 1
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        log("usage_by_key failed: %s" % exc)
+    out = sorted(buckets.values(), key=lambda b: -b["total_tokens"])
+    for item in out:
+        item["models"] = sorted(item["models"].items(), key=lambda kv: -kv[1])[:5]
+        item["credit"] = round(item["credit"], 6)
+        item["original_credits"] = round(item["original_credits"], 6)
+    return out
+
+
+_series_cache = {}
+_series_lock = threading.Lock()
+
+
+def usage_timeseries(realm=None, range=None, since=None, until=None,
+                     bucket_seconds=None, ttl=10):
+    """分桶的 token/积分时序（面板时序图）。
+
+    桶宽随窗口自适应：minute（span <= 6h）/ hour（<= 14d）/ day（其余），
+    显式 bucket_seconds 覆盖（下限 60 秒）。计数口径与 KPI/模型表一致：
+    非 error 行计入 requests 与各 token 字段，error 行计入 errors；credit 对
+    所有行累加（与 _usage_snapshot_uncached 的 USAGE_FIELDS 口径相同）。
+    最近 50 条 credit > 0 的请求随行返回，面板无需再打一个端点。
+
+    缓存按**解析后的边界 + 桶宽**分键：week/month 相互重叠，一个"范围标签"
+    无法描述两个窗口；桶宽不同即载荷不同（自动桶宽会随 span 翻转）。
+    """
+    r = realm or CURRENT_REALM
+    lo, hi = range_window(range, since, until)
+    pinned_lo, pinned_hi = lo, hi
+    # 「显式给了窗口参数」与「完全没给」必须分开：
+    #   · 没给（老面板/裸调用）→ 图表默认看最近 24 小时（改动前的既有行为）；
+    #   · 给了 range=all（或 custom 但只给了一端）→ 该侧是**真的无界**，
+    #     不能悄悄缩成 24 小时，否则 KPI(range=all=全量) 与序列(近 24h) 不自洽。
+    explicit = not (range is None and since is None and until is None)
+    if hi is None:
+        hi = time.time()
+    if lo is None:
+        lo = 0 if explicit else hi - 86400
+    span = max(1.0, hi - lo)
+    if bucket_seconds:
+        step = max(60, int(bucket_seconds))
+    elif span <= 6 * 3600:
+        step = 60
+    elif span <= 14 * 86400:
+        step = 3600
+    else:
+        step = 86400
+    now = time.time()
+    edge = "unbounded" if explicit else "auto"
+    key = (r or "all", pinned_lo if pinned_lo is not None else edge,
+           pinned_hi if pinned_hi is not None else edge, step)
+    with _series_lock:
+        hit = _series_cache.get(key)
+        if hit is not None and (now - hit[0]) < ttl:
+            return hit[1]
+    data = _usage_timeseries_uncached(r, lo, hi, step)
+    with _series_lock:
+        _series_cache[key] = (time.time(), data)
+    return data
+
+
+def _usage_timeseries_uncached(realm, lo, hi, step):
+    """One uncached pass over the log, folding rows into fixed-width buckets."""
+    buckets = {}
+    credits = []
+    try:
+        with open(USAGE_LOG, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                if realm and not row_matches_realm(row, realm):
+                    continue
+                at = row.get("at")
+                at = at if isinstance(at, (int, float)) else 0
+                if at < lo or at > hi:
+                    continue
+                key = int((at - lo) // step)
+                bucket = buckets.setdefault(key, {
+                    "at": lo + key * step, "requests": 0, "errors": 0,
+                    "prompt_tokens": 0, "completion_tokens": 0,
+                    "reasoning_tokens": 0, "cached_tokens": 0,
+                    "total_tokens": 0, "credit": 0.0,
+                })
+                if row.get("error"):
+                    bucket["errors"] += 1
+                else:
+                    bucket["requests"] += 1
+                    for field in ("prompt_tokens", "completion_tokens",
+                                  "reasoning_tokens", "cached_tokens",
+                                  "total_tokens"):
+                        bucket[field] += (row.get(field) or 0)
+                credit = row.get("credit") or 0
+                bucket["credit"] += credit
+                if credit > 0:
+                    credits.append({
+                        "at": at, "iso": row.get("iso") or "",
+                        "model": row.get("model") or "",
+                        "account": row.get("account") or "",
+                        "credit": credit,
+                        "total_tokens": row.get("total_tokens") or 0,
+                    })
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        log("usage timeseries read failed: %s" % exc)
+    credits.sort(key=lambda item: item.get("at") or 0, reverse=True)
+    return {
+        "ok": True, "realm": realm or "all", "bucket_seconds": step,
+        "since": lo, "until": hi,
+        "series": [buckets[key] for key in sorted(buckets)],
+        "credits": credits[:50],
+    }
+
+
+def compute_usage_analytics(range=None, since=None, until=None):
+    """Detailed analytics for Token, Cache, and Reasoning metrics page.
+
+    range/since/until 为可选时间窗口，语义见 range_window()。**不传时是 legacy
+    模式：不新增任何键、不过滤任何行**，输出与改动前逐字节一致（老面板不受影响）；
+    传了才追加顶层 window 边界、summary.window 桶与每账号/每模型的 window 桶。
+    """
     now = time.localtime()
     today_ts = time.mktime((now.tm_year, now.tm_mon, now.tm_mday, 0, 0, 0, 0, 0, -1))
+    lo, hi = range_window(range, since, until)
+    legacy = (not str(range or "").strip() and since is None and until is None)
 
     def new_stat():
         return {
@@ -957,6 +1357,10 @@ def compute_usage_analytics():
 
     all_summary = new_stat()
     today_summary = new_stat()
+    # 窗口桶：legacy 模式下不进入输出，但循环结构保持统一（避免复制一份过滤逻辑）
+    window_summary = new_stat()
+    win_acct = {}       # uid -> {"stat": stat, "models": {model: {...}}}
+    win_model = {}      # model id -> stat
     acct_map = {}
     model_map = {}
     if os.path.exists(USAGE_LOG):
@@ -973,6 +1377,7 @@ def compute_usage_analytics():
                     is_err = bool(r.get("error"))
                     at = r.get("at", 0)
                     is_today = (at >= today_ts)
+                    in_window = _row_in_window(r, lo, hi)
                     acct_uid = r.get("account") or "(unattributed)"
                     m_id = r.get("model") or "(unknown)"
 
@@ -999,6 +1404,8 @@ def compute_usage_analytics():
                     feed(all_summary, is_err)
                     if is_today:
                         feed(today_summary, is_err)
+                    if in_window:
+                        feed(window_summary, is_err)
                     if acct_uid not in acct_map:
                         acct_map[acct_uid] = {
                             "uid": acct_uid,
@@ -1013,6 +1420,16 @@ def compute_usage_analytics():
                     feed(acct_map[acct_uid]["all_time"], is_err)
                     if is_today:
                         feed(acct_map[acct_uid]["today"], is_err)
+                    if in_window:
+                        slot = win_acct.setdefault(
+                            acct_uid, {"stat": new_stat(), "models": {}})
+                        feed(slot["stat"], is_err)
+                        if not is_err:
+                            wm = slot["models"].setdefault(
+                                m_id, {"requests": 0, "tokens": 0, "reasoning": 0})
+                            wm["requests"] += 1
+                            wm["tokens"] += (r.get("total_tokens") or 0)
+                            wm["reasoning"] += (r.get("reasoning_tokens") or 0)
                     if not is_err:
                         tm = acct_map[acct_uid]["all_models"].setdefault(
                             m_id, {"requests": 0, "tokens": 0, "reasoning": 0})
@@ -1031,6 +1448,8 @@ def compute_usage_analytics():
                     feed(model_map[m_id]["all_time"], is_err)
                     if is_today:
                         feed(model_map[m_id]["today"], is_err)
+                    if in_window:
+                        feed(win_model.setdefault(m_id, new_stat()), is_err)
         except Exception as exc:
             log("compute_usage_analytics failed: %s" % exc)
     if POOL:
@@ -1076,18 +1495,62 @@ def compute_usage_analytics():
     for m in model_map.values():
         finalize(m["today"])
         finalize(m["all_time"])
+    if not legacy:
+        finalize(window_summary)
+        for slot in win_acct.values():
+            finalize(slot["stat"])
+        for stat in win_model.values():
+            finalize(stat)
     accts_list = sorted(acct_map.values(),
                         key=lambda a: (-a["today"]["total_tokens"],
                                        -a["all_time"]["total_tokens"]))
     models_list = sorted(model_map.values(),
                          key=lambda m: (-m["today"]["total_tokens"],
                                         -m["all_time"]["total_tokens"]))
-    return {
+    result = {
         "today_ts": today_ts,
         "summary": {"today": today_summary, "all_time": all_summary},
         "accounts": accts_list,
         "models": models_list,
     }
+    if not legacy:
+        # 只在实际传了窗口时追加这三个桶；legacy 输出逐字节不变（老面板零影响）。
+        # 排序仍沿用 today/all_time（面板可自行按 window 重排），避免改变既有顺序。
+        result["window"] = {"since": lo, "until": hi}
+        result["summary"]["window"] = window_summary
+        for a in accts_list:
+            slot = win_acct.get(a["uid"])
+            a["window"] = slot["stat"] if slot else finalize(new_stat())
+            a["window_models"] = slot["models"] if slot else {}
+        for m in models_list:
+            m["window"] = win_model.get(m["model"]) or finalize(new_stat())
+    return result
+
+
+def free_model_names(realm=None):
+    """目录里 is_free 的模型名集合（含上游 key 与别名）。
+
+    与护栏阈值**同批**推给池（R3）：free 名单为空集时 credit 守卫会拦住
+    全部模型，所以只要启用了 daily_credit_limit，名单就必须一起推。
+    只读本地目录快照，不联网；失败只记 WARN 并返回已收集部分。
+    """
+    names = set()
+    try:
+        for mid, meta in fetch_models(realm=realm or CURRENT_REALM):
+            meta = meta if isinstance(meta, dict) else {}
+            if not meta.get("is_free"):
+                continue
+            vals = [mid, meta.get("key"), meta.get("alias"),
+                    meta.get("display_name")]
+            extra = meta.get("aliases")
+            if isinstance(extra, (list, tuple, set)):
+                vals.extend(extra)
+            for cand in vals:
+                if isinstance(cand, str) and cand.strip():
+                    names.add(cand.strip())
+    except Exception as exc:
+        log("free model list probe failed: %s" % exc, level="WARN")
+    return names
 
 
 def runtime_settings_view():
@@ -1118,6 +1581,10 @@ def runtime_settings_view():
         "api_key_masked": masked,
         "auth_required": auth_required(),
         "api_keys": keys,
+        # limits 与保存分支同源：limits_data 返回**完整形状**（每个守卫都补齐
+        # global/intl/cn，未设时全为 0/None），面板读到即可安全回显、再保存不会
+        # 把已有阈值覆盖成默认值。
+        "limits": qoder_settings.limits_data(ACCOUNTS_DIR),
         "accounts_dir": ACCOUNTS_DIR,
         "usage_dir": USAGE_DIR,
         "settings_file": qoder_settings.settings_path(ACCOUNTS_DIR),
@@ -1137,6 +1604,14 @@ AFFINITY_BY_PREFIX = os.environ.get("QD_AFFINITY_BY_PREFIX", "1").lower() not in
     "0", "false", "no", "off")
 AFFINITY_DEBUG = os.environ.get("QD_AFFINITY_DEBUG", "0").lower() in (
     "1", "true", "yes", "on")
+# P1-6 会话亲和长度上限：对话超过该条数就不再绑定账号（长对话的请求体只会越来越大，
+# 钉在同一账号等于让下一轮同样超长）。0 = 关闭上限，**默认关闭**，行为与改动前一致。
+# 阈值不照搬参考项目：那张断连率表来自其单一实例的 333 个请求、上游也不同，本仓无
+# 自有曲线，因此先给机制、等实测再定值。非数字取值按 0 处理（不在 import 期抛异常）。
+try:
+    AFFINITY_MAX_MSGS = int(os.environ.get("QD_AFFINITY_MAX_MSGS", "0") or 0)
+except (TypeError, ValueError):
+    AFFINITY_MAX_MSGS = 0
 
 
 def derive_affinity_key(messages):
@@ -1151,6 +1626,12 @@ def derive_affinity_key(messages):
     try:
         msgs = messages or []
         if not msgs:
+            return None
+        # P1-6：超长对话放弃亲和（== 上限仍绑定，> 上限释放）
+        if AFFINITY_MAX_MSGS > 0 and len(msgs) > AFFINITY_MAX_MSGS:
+            if AFFINITY_DEBUG:
+                log("affinity: skip %d msgs (> %d), letting the pool rotate"
+                    % (len(msgs), AFFINITY_MAX_MSGS))
             return None
         head = msgs[:2]
         blob = json.dumps(head, ensure_ascii=False,
@@ -1985,6 +2466,24 @@ def normalize_reasoning_effort(effort, meta):
     return best, "unsupported level %s -> %s" % (e, best)
 
 
+def requested_effort(payload):
+    """请求侧的**原始**思考档位（归一化之前），供 usage 记账与请求体构造共用。
+
+    取值顺序与 build_qoder_body 下发给上游时完全一致（同源，避免两处漂移）：
+    reasoning_effort -> reasoning.effort -> thinking.effort / thinking.level。
+    仅做提取，不做任何归一化或猜测；空值返回 None。
+    """
+    if not isinstance(payload, dict):
+        return None
+    effort = payload.get("reasoning_effort")
+    if not effort and isinstance(payload.get("reasoning"), dict):
+        effort = (payload.get("reasoning") or {}).get("effort")
+    if not effort and isinstance(payload.get("thinking"), dict):
+        # 兼容 thinking.effort / thinking_level 风格客户端
+        effort = (payload.get("thinking") or {}).get("effort")             or (payload.get("thinking") or {}).get("level")
+    return effort or None
+
+
 # ---------------------------------------------------------------------------
 # 项目新版本检测（对比 GitHub 最新 release；结果缓存 6 小时）
 # ---------------------------------------------------------------------------
@@ -2097,6 +2596,15 @@ def backfill_reasoning_content(messages, model, model_key=""):
     return out
 
 
+# P2-2：tool_choice="none" 时是否连 tools 一起删（历史行为）。
+# 默认**保留** tools 并把 "none" 原样写回 —— 工具能力声明与「本轮不许调用」是两件事，
+# 且上游实测对 tools+none 返回纯文本、不报 400。若某天上游不再遵守 none（参考项目
+# wb 的上游就有此现象：保留 tools 后仍回 tool_calls），设 QD_TOOLCHOICE_NONE_DROPS_TOOLS=1
+# 可一键回到「连 tools 一起删」的旧行为，无需改代码发版。
+TOOLCHOICE_NONE_DROPS_TOOLS = os.environ.get(
+    "QD_TOOLCHOICE_NONE_DROPS_TOOLS", "0").lower() in ("1", "true", "yes", "on")
+
+
 def normalize_tool_choice(obj):
     """把 OpenAI tool_choice 归一成上游可接受的形态（避免 400）。"""
     if "tool_choice" not in obj:
@@ -2105,14 +2613,22 @@ def normalize_tool_choice(obj):
     if isinstance(tc, str):
         val = tc.strip().lower()
         if val == "none":
-            obj.pop("tool_choice", None)
-            obj.pop("tools", None)
+            if TOOLCHOICE_NONE_DROPS_TOOLS:
+                obj.pop("tool_choice", None)
+                obj.pop("tools", None)
+            else:
+                # 保留 tools 声明，只把「本轮不许调用」写在 tool_choice 上（上游只认字符串）
+                obj["tool_choice"] = "none"
         return
     if isinstance(tc, dict):
         typ = (tc.get("type") or "").strip().lower()
         if typ == "none":
-            obj.pop("tool_choice", None)
-            obj.pop("tools", None)
+            if TOOLCHOICE_NONE_DROPS_TOOLS:
+                obj.pop("tool_choice", None)
+                obj.pop("tools", None)
+            else:
+                # 对象形式降级为字符串 "none"（与 auto/required 的既有降级风格一致）
+                obj["tool_choice"] = "none"
         elif typ in ("auto", "required"):
             obj["tool_choice"] = typ
         elif typ == "function":
@@ -3034,8 +3550,16 @@ def build_qoder_body(payload, account, model_key, realm=None):
     model = payload.get("model") or ""
     messages = backfill_reasoning_content(messages, model, model_key)
 
-    use_structured = structured_tool_history_enabled(
-        model=model, model_key=model_key, realm=r, messages=messages)
+    # 形态决策**单点**（设计文档 §0 原则①）：Anthropic 等新入口会把决定好的
+    # 结果放在 payload["_qd_structured"] 里下传，这里优先采信它；只有 chat 主链路
+    # （不带该键）才在本函数内自行判定。两处各判一次会导致「桥接层以为结构化、
+    # flatten 却走文本化」的错配，症状正是客户端收到信封文本。
+    use_structured = payload.get("_qd_structured")
+    if use_structured is None:
+        use_structured = structured_tool_history_enabled(
+            model=model, model_key=model_key, realm=r, messages=messages)
+    else:
+        use_structured = bool(use_structured)
     system_text, flat, images = flatten_messages(
         messages, keep_reasoning=is_deepseek_model(model, model_key),
         structured=use_structured)
@@ -3120,13 +3644,8 @@ def build_qoder_body(payload, account, model_key, realm=None):
             params["max_tokens"] = int(max_tokens)
         except (TypeError, ValueError):
             pass
-    effort = payload.get("reasoning_effort")
-    if not effort and isinstance(payload.get("reasoning"), dict):
-        effort = (payload.get("reasoning") or {}).get("effort")
-    if not effort and isinstance(payload.get("thinking"), dict):
-        # 兼容 thinking.effort / thinking_level 风格客户端
-        effort = (payload.get("thinking") or {}).get("effort") \
-            or (payload.get("thinking") or {}).get("level")
+    # 提取与 usage 记账共用同一实现（requested_effort），避免两处口径漂移
+    effort = requested_effort(payload)
     if effort:
         norm, note = normalize_reasoning_effort(effort, catalog_meta)
         if note:
@@ -3392,6 +3911,10 @@ def _handle_envelope_account_cooldown(account, exc, model=None, session_key=None
     else:
         account.note_error("envelope HTTP %s: %s" % (status_int, detail[:80]),
                            cooldown=15, single_account=(total <= 1))
+        # task-74 三族之三：未知信封错误 -> 降权窗口；**内容审核类除外**（那是
+        # 请求内容的确定性拒绝，不代表账号有问题）；单号池不接（total<=1）。
+        if total > 1 and not any(m in detail for m in _CLIENT_FAULT_MARKERS):
+            account.note_unknown_failure("envelope HTTP %s" % status_int)
 
 def should_retry_envelope(exc, emitted_bytes, attempt):
     """流内错误信封是否值得**重开上游**再试。
@@ -3483,8 +4006,12 @@ def aggregate_with_envelope_retry(resp, payload, session_key, realm, model,
                 pass
 
 
-def open_upstream(payload, session_key=None, target_realm=None):
+def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
     """构造 COSY 签名请求并打开上游 SSE。返回 (resp, account, encoded)。
+
+    usage_ctx：可选**出参** dict。传入时回填本次请求的推理档位审计信息
+    （effort_requested = 客户端原值；effort = 实际写进上游 parameters 的值，
+    None 表示未下发）。不传 = 与改动前逐字节一致（旧调用点全部不传）。
 
     账号轮换规则：
       - 401/403：凭证被拒 -> 冷却该账号（单账号池时短冷却）换号
@@ -3500,6 +4027,12 @@ def open_upstream(payload, session_key=None, target_realm=None):
 
     representative = POOL.pick(realm=realm) if POOL else None
     body_obj = build_qoder_body(payload, representative, model_key, realm=realm)
+    if usage_ctx is not None:
+        # 实际下发档位直接取自请求体（build_qoder_body 只在 norm 非 None 时写入），
+        # 与真实出站内容同源，不做二次推算。
+        usage_ctx["effort_requested"] = requested_effort(payload)
+        usage_ctx["effort"] = (body_obj.get("parameters") or {}).get(
+            "reasoning_effort")
     encoded = qoder_encode(json.dumps(body_obj, ensure_ascii=False).encode("utf-8"))
 
     if not session_key:
@@ -3618,7 +4151,9 @@ def open_upstream(payload, session_key=None, target_realm=None):
                 break
 
         if resp is not None:
-            account.clear_error(model=model)
+            # task-74 三族：成功收尾 -> 统一复位（三族计数 + 软冷却 + 模型冷却）。
+            # note_success 是 clear_error(model) 的超集；刻意不动 balance_until。
+            account.note_success(model=model)
             return resp, account, encoded
 
         exc = last_exc
@@ -3627,6 +4162,10 @@ def open_upstream(payload, session_key=None, target_realm=None):
             if exc.code == 429:
                 account.note_error("HTTP 429 (model throttled)", model=model,
                                    cooldown=60)
+                # task-74 三族之一：账号级软限流退避（连续才涨；单号池不接，
+                # 免得一次排队就把唯一账号冷 10 分钟——那是变相打死）。
+                if total > 1:
+                    account.note_soft_rate("HTTP 429 upstream")
                 log("account %s throttled on '%s' (429), retry in 60s"
                     % (account.uid[:8], model))
                 if session_key and POOL:
@@ -3658,6 +4197,10 @@ def open_upstream(payload, session_key=None, target_realm=None):
                 account.note_error(
                     "HTTP %s upstream transient: %s" % (exc.code, detail[:80]),
                     cooldown=15, single_account=(total <= 1))
+                # task-74 三族之二：连续硬失败喂熔断计数（3 次才起跳；单号池不接）
+                if total > 1:
+                    account.note_failure(
+                        "HTTP %s upstream transient" % exc.code)
                 log("upstream still transient (HTTP %d) after %d tries on "
                     "'%s' - short cooldown, rotating"
                     % (exc.code, TRANSIENT_MAX_RETRIES + 1, account.uid[:8]),
@@ -3681,6 +4224,10 @@ def open_upstream(payload, session_key=None, target_realm=None):
                     # 传输抖动重试耗尽：短冷却换号（不重罚账号）
                     account.note_error("transport transient: %s" % str(exc)[:100],
                                        cooldown=15, single_account=(total <= 1))
+                    # task-74 三族之二（同族）：传输类连续硬失败喂熔断计数
+                    if total > 1:
+                        account.note_failure("transport transient: %s"
+                                             % type(exc).__name__)
                     log("upstream transport still failing after %d tries on "
                         "'%s' - short cooldown"
                         % (TRANSIENT_MAX_RETRIES + 1, account.uid[:8]),
@@ -3688,6 +4235,9 @@ def open_upstream(payload, session_key=None, target_realm=None):
                 else:
                     account.note_error(str(exc)[:120], cooldown=60,
                                        single_account=(total <= 1))
+                    # task-74 三族之三：未知异常 -> 降权窗口（不是不可用）
+                    if total > 1:
+                        account.note_unknown_failure(str(exc)[:120])
                 last_error = exc
             continue
 
@@ -5420,6 +5970,11 @@ class Handler(BaseHTTPRequestHandler):
             "Bearer ").strip()
         if supplied:
             return supplied
+        # Anthropic 客户端（Claude Code 等）用 x-api-key 头，而不是
+        # Authorization: Bearer —— 漏掉这一路回退会让 /v1/messages 全量 401。
+        anthropic_key = (self.headers.get("x-api-key") or "").strip()
+        if anthropic_key:
+            return anthropic_key
         # 浏览器顶层导航无法设置头，所以 ?key= 也接受（看板跨设备打开用）。
         try:
             query = parse_qs(urlparse(self.path).query)
@@ -5443,6 +5998,14 @@ class Handler(BaseHTTPRequestHandler):
         """Realm bound to the key this request used, or "" when unbound."""
         return (self.key_entry or {}).get("realm") or ""
 
+    def _key_id_for_usage(self):
+        """usage 行归属用的 API key 标识（panel 分配的 id / legacy / launcher）。
+
+        只取 `key_entry["id"]`——它是 panel 生成的稳定 id，**绝不含明文 key**
+        （本仓红线）；无 key（面板会话 / 未开鉴权）时返回空串，调用方据此不写该键。
+        """
+        return str((self.key_entry or {}).get("id") or "")
+
     def _cross_realm_error(self, model, realm):
         """解释模型/出口错配，替代上游晦涩的 403。"""
         if not realm or not model:
@@ -5456,6 +6019,36 @@ class Handler(BaseHTTPRequestHandler):
         return ("模型 %s 只在%s提供，但「%s」绑定的是%s出口。"
                 "请改用对应出口的 Key，或把该 Key 的出口改为「跟随面板切换」。"
                 % (model, served, name, used))
+
+    def _banned_model_error(self, model):
+        """P1-4 全局封禁：命中即返回文案（不碰上游、不扣任何点数）。"""
+        if not is_model_banned(model):
+            return ""
+        return banned_model_message(model)
+
+    def _key_model_error(self, model):
+        """P1-4 每 Key 模型白名单：在请求到达上游之前拒绝。
+
+        未设 models 的 Key 不受限（空列表 = 不限制），因此这是 no-op，
+        除非管理员显式配置了限制。
+        """
+        entry = getattr(self, "key_entry", None)
+        if not entry:
+            return ""
+        if qoder_settings.key_allows_model(entry, model):
+            return ""
+        return key_model_message(entry, model)
+
+    def _model_precheck(self, model, realm):
+        """模型级前置拒绝（统一落点，全部在 open_upstream 之前）。
+
+        顺序：跨区错配[既有] -> 全局封禁[P1-4] -> Key 白名单[P1-4]。
+        三处请求入口（chat / responses / anthropic messages）**共用本方法**——
+        新增入口必须一并挂上，否则会出现「chat 被拦、别的协议绕过」的缺口。
+        """
+        return (self._cross_realm_error(model, realm)
+                or self._banned_model_error(model)
+                or self._key_model_error(model))
 
     def _request_realm(self, explicit=None):
         """Pick the upstream exit for this request.
@@ -5640,6 +6233,13 @@ class Handler(BaseHTTPRequestHandler):
             req_realm = query.get("realm", [None])[0] \
                 or self.headers.get("X-Realm") or CURRENT_REALM
             return self._json(200, recent_usage(limit, realm=req_realm, page=page))
+        if path == "/credits/summary":
+            # issue #21：只读积分汇总。**刻意不放进 _is_panel_route** ——
+            # 同宿主机轮询方用 API key 即可拉取；实现内绝不触发上游查询
+            # （对照 /accounts/credits 的逐号强刷，那个适合手动点击）。
+            if not self._authorized():
+                return
+            return self._json(200, credits_summary())
         if path == "/accounts/credits":
             if not self._authorized():
                 return
@@ -5695,11 +6295,25 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/usage/analytics":
             if not self._authorized():
                 return
-            return self._json(200, compute_usage_analytics())
+            # ?range=day|week|month|all|custom&since=&until=（不传 = 历史全量，
+            # 输出与改动前逐字节一致；语义见 range_window）
+            req_range, req_since, req_until = range_query(query)
+            return self._json(200, compute_usage_analytics(
+                range=req_range, since=req_since, until=req_until))
         if path == "/usage/by-account":
             if not self._authorized():
                 return
-            return self._json(200, {"accounts": usage_by_account()})
+            req_range, req_since, req_until = range_query(query)
+            return self._json(200, {"accounts": usage_by_account(
+                range=req_range, since=req_since, until=req_until)})
+        if path == "/usage/by-key":
+            if not self._authorized():
+                return
+            # P1-3 收尾：按 API key 聚合（key_id 已脱敏；缺失归 "(no-key)"）。
+            # 与 /usage/by-account 同源同 range —— 同一窗口下两者合计相等。
+            req_range, req_since, req_until = range_query(query)
+            return self._json(200, {"keys": usage_by_key(
+                range=req_range, since=req_since, until=req_until)})
         if path == "/usage/perf":
             if not self._authorized():
                 return
@@ -5710,7 +6324,22 @@ class Handler(BaseHTTPRequestHandler):
                 sample = 5000
             req_realm = query.get("realm", [None])[0] \
                 or self.headers.get("X-Realm") or CURRENT_REALM
-            return self._json(200, perf_stats(sample, realm=req_realm))
+            req_range, req_since, req_until = range_query(query)
+            return self._json(200, perf_stats(sample, realm=req_realm,
+                                              range=req_range,
+                                              since=req_since,
+                                              until=req_until))
+        if path == "/usage/timeseries":
+            if not self._authorized():
+                return
+            # 时序图：分桶 token/积分序列（桶宽自适应，可 ?bucket= 覆盖）
+            req_realm = query.get("realm", [None])[0] \
+                or self.headers.get("X-Realm") or CURRENT_REALM
+            req_range, req_since, req_until = range_query(query)
+            return self._json(200, usage_timeseries(
+                realm=req_realm, range=req_range, since=req_since,
+                until=req_until,
+                bucket_seconds=(query.get("bucket") or [None])[0]))
         if path == "/tasks":
             if not self._authorized():
                 return
@@ -5883,9 +6512,16 @@ class Handler(BaseHTTPRequestHandler):
                     "realm": realm,
                     "enabled": item.get("enabled", True) is not False,
                     "created_at": created_at,
+                    # P1-4：每 Key 模型白名单（原样透传；规范化统一在
+                    # qoder_settings._clean_key_entry 一处完成）。
+                    "models": item.get("models"),
                 })
             qoder_settings.set_api_keys(ACCOUNTS_DIR, cleaned)
             reply["api_keys_saved"] = len(cleaned)
+        if "banned_models" in payload:
+            # P1-4：全局封禁列表（逗号/分号/换行分隔均可，清洗在 qoder_settings）。
+            reply["banned_models"] = qoder_settings.set_banned_models(
+                ACCOUNTS_DIR, payload.get("banned_models"))
         if "auth_disabled" in payload:
             qoder_settings.set_auth_disabled(ACCOUNTS_DIR,
                                              payload.get("auth_disabled"))
@@ -5901,6 +6537,37 @@ class Handler(BaseHTTPRequestHandler):
             API_KEY = new_key
             API_KEY_FILE_SET = True
             reply["api_key_set"] = bool(new_key)
+        if "limits" in payload:
+            raw_limits = payload.get("limits")
+            if not isinstance(raw_limits, dict):
+                return self._error(400, "limits must be an object",
+                                   "invalid_request_error")
+            # 先全量校验、后落盘：避免一半合法一半 400 时留下部分应用。
+            updates = []
+            for key, scopes in raw_limits.items():
+                if key not in qoder_settings.LIMIT_KEYS:
+                    return self._error(400, "unknown limit: %s" % key,
+                                       "invalid_request_error")
+                if not isinstance(scopes, dict):
+                    return self._error(400, "limits.%s must be an object" % key,
+                                       "invalid_request_error")
+                for scope, value in scopes.items():
+                    if scope not in qoder_settings.LIMIT_SCOPES:
+                        return self._error(400, "unknown scope: %s" % scope,
+                                           "invalid_request_error")
+                    updates.append((key, scope, value))
+            for key, scope, value in updates:
+                qoder_settings.set_limit(ACCOUNTS_DIR, key, scope, value)
+            reply["limits"] = qoder_settings.limits_data(ACCOUNTS_DIR)
+            # task-61：保存后立刻推给池（阈值 + free 名单同批），让配置真正生效；
+            # 推完若某个阈值 > 0，池会自行惰性启动后台余额刷新线程。
+            try:
+                POOL.apply_settings(limits_data=reply["limits"],
+                                    free_models=free_model_names(CURRENT_REALM))
+            except Exception as exc:
+                reply["limits_apply_error"] = str(exc)
+                log("quota limits apply failed after save: %s" % exc,
+                    level="WARN")
         if payload.get("restart_scheduler"):
             if SCHEDULER:
                 SCHEDULER.stop()
@@ -6107,11 +6774,13 @@ class Handler(BaseHTTPRequestHandler):
                     "credits": res.get("credits"),
                     # issue #20：透传 qoder_tasks 的精确结论（前端一直在读
                     # message / claimed / next_available_*，此前永远 undefined）。
-                    # 新增而非替换：msg/logs/credits 原样保留；老路径没有
-                    # 这些 key 时为 None（前端有兼容层），不编造默认值、
-                    # 也不参与签到主流程判定。
+                    # 新增而非替换：msg/logs/credits 原样保留。naonao 的契约
+                    # （qoder_tasks 活动平台路径）保证 claimed 是**字符串列表**；
+                    # 老路径（旧 sash 兜底）不带该键 -> 这里统一给 []，
+                    # 让前端只需 Array.isArray 判定，不用再判 None。
+                    # message / next_available_* 缺失时仍为 None（不编造）。
                     "message": res.get("message"),
-                    "claimed": res.get("claimed"),
+                    "claimed": res.get("claimed") or [],
                     "next_available_at": res.get("next_available_at"),
                     "next_available_note": res.get("next_available_note"),
                 })
@@ -6323,6 +6992,153 @@ class Handler(BaseHTTPRequestHandler):
         return self._error(404, "unknown account endpoint",
                            "invalid_request_error")
 
+    def _handle_anthropic(self, path, payload):
+        """Anthropic /v1/messages（task-78 接线；设计文档 .team/72-ANTHROPIC-BRIDGE-DESIGN.md §7）。
+
+        三条易错点逐条落地：
+          1) 形态决策**只算一次**（写进 chat_req["_qd_structured"] 下传）；
+          2) 流式守卫链与 chat 链逐字一致，allowed_names 取**转换后的 chat_req**；
+          3) 出站只做协议翻译，不在本层重写吞掉/回读。
+        能力差异（有意）：流式**不做流内信封重开** —— Anthropic 客户端对重复
+        message_start 的容忍度未知，宁可给明确的 event: error 收尾；非流式仍走
+        aggregate_with_envelope_retry（此时尚未向客户端写任何字节，重试安全）。
+        """
+        if path.endswith("/count_tokens"):
+            # 纯本地估算：**不发上游**（判据 4）
+            return self._json(
+                200, qoder_anthropic.estimate_anthropic_tokens(payload))
+        ok, problem = qoder_anthropic.validate_request(payload)
+        if not ok:
+            return self._error(400, problem, "invalid_request_error")
+        chat_req = qoder_anthropic.messages_to_chat(payload)
+        model = chat_req.get("model") or payload.get("model") or "auto"
+        want_stream = bool(payload.get("stream"))
+        session_key = extract_session_key(self.headers, chat_req)
+        fp = prompt_fingerprint(chat_req.get("messages"))
+        t_start = time.time()
+        req_realm = self._request_realm() or CURRENT_REALM
+        model_key = qoder_catalog.resolve_upstream_key(model, realm=req_realm)
+        # ---- 形态决策单点：在这里算唯一一次，随 chat_req 下传 ----
+        chat_req["_qd_structured"] = structured_tool_history_enabled(
+            model=model, model_key=model_key, realm=req_realm,
+            messages=chat_req.get("messages"))
+        holder = {"usage": None,
+                  "allowed_names": _tool_names_from_payload(chat_req)}
+        log("anthropic: model=%s stream=%s msgs=%d effort=%r structured=%s"
+            % (model, want_stream, len(chat_req.get("messages") or []),
+               chat_req.get("reasoning_effort"),
+               bool(chat_req.get("_qd_structured"))))
+        try:
+            usage_ctx = {}
+            blocked = self._model_precheck(chat_req.get("model"), req_realm)
+            if blocked:
+                return self._error(400, blocked, "invalid_request_error")
+            upstream, account, _ = open_upstream(
+                chat_req, session_key=session_key, target_realm=req_realm,
+                usage_ctx=usage_ctx)
+        except RateLimited as exc:
+            record_error(model, 429, exc.detail[:200],
+                         elapsed_ms=int((time.time() - t_start) * 1000))
+            return self._rate_limited(exc)
+        except urllib.error.HTTPError as exc:
+            detail = getattr(exc, "qoder_detail", "")
+            if not detail:
+                try:
+                    detail = exc.read(600).decode("utf-8", "replace")
+                except Exception:
+                    detail = ""
+            record_error(model, exc.code, detail,
+                         elapsed_ms=int((time.time() - t_start) * 1000))
+            msg, etype = friendly_upstream_error(exc.code, detail)
+            return self._error(exc.code, msg, etype)
+        except Exception as exc:
+            message = str(exc)
+            record_error(model, 502, message,
+                         elapsed_ms=int((time.time() - t_start) * 1000))
+            if message.startswith("no usable account"):
+                return self._error(503, message
+                                   + " - add or enable one at the dashboard (/)")
+            return self._error(502, "upstream unreachable: %s" % exc)
+        with upstream:
+            if want_stream:
+                self._sse_begin()
+                first_ms = None
+                try:
+                    # 守卫链与 chat 主链路**逐字一致**（顺序与参数都不能改）：
+                    #   sse_with_heartbeat(recover_leaked_tool_calls(
+                    #       iter_inner_sse(...), allowed_names=...))
+                    # allowed_names 必须来自**转换后的 chat_req**；用 Anthropic
+                    # 原始 payload 会取不到工具名 -> 回读守卫失效 -> #9/#11 泄漏回归。
+                    inner = sse_with_heartbeat(
+                        recover_leaked_tool_calls(
+                            iter_inner_sse(upstream, holder=holder),
+                            allowed_names=_tool_names_from_payload(chat_req)),
+                        self._sse_write)
+                    for frame in qoder_anthropic.stream_anthropic_events(
+                            inner, model, holder):
+                        if first_ms is None:
+                            first_ms = int((time.time() - t_start) * 1000)
+                        self._sse_write(frame)
+                except (BrokenPipeError, ConnectionResetError,
+                        ConnectionAbortedError):
+                    wall = int((time.time() - t_start) * 1000)
+                    record_usage(model, holder.get("usage"), stream=True,
+                                 elapsed_ms=wall, ttft_ms=first_ms,
+                                 gen_ms=(wall - first_ms)
+                                 if first_ms is not None else None,
+                                 fp=fp, account=account.uid,
+                                 effort=usage_ctx.get("effort"),
+                                 effort_requested=usage_ctx.get("effort_requested"),
+                                 key_id=self._key_id_for_usage())
+                    return
+                except UpstreamStatus as exc:
+                    # Anthropic 侧不重开（见 docstring）：直接给终态 error 事件。
+                    _handle_envelope_account_cooldown(account, exc, model=model,
+                                                      session_key=session_key)
+                    wall = int((time.time() - t_start) * 1000)
+                    record_error(model, exc.status, exc.detail, elapsed_ms=wall)
+                    msg, _ = friendly_upstream_error(_to_int_status(exc.status),
+                                                     exc.detail)
+                    log("anthropic upstream status %s: %s"
+                        % (exc.status, msg[:200]), level="ERROR", tag="chat")
+                    self._sse_write(qoder_anthropic.anthropic_error_frame(msg))
+                    self._sse_end()
+                    return
+                self._sse_end()
+                wall = int((time.time() - t_start) * 1000)
+                record_usage(model, holder.get("usage"), stream=True,
+                             elapsed_ms=wall, ttft_ms=first_ms,
+                             gen_ms=(wall - first_ms)
+                             if first_ms is not None else None,
+                             fp=fp, account=account.uid,
+                             effort=usage_ctx.get("effort"),
+                             effort_requested=usage_ctx.get("effort_requested"),
+                             key_id=self._key_id_for_usage())
+                return
+            try:
+                chat_obj, account = aggregate_with_envelope_retry(
+                    upstream, chat_req, session_key, req_realm, model,
+                    holder, account)
+            except UpstreamStatus as exc:
+                record_error(model, exc.status, exc.detail,
+                             elapsed_ms=int((time.time() - t_start) * 1000))
+                msg, etype = friendly_upstream_error(_to_int_status(exc.status),
+                                                     exc.detail)
+                return self._error(
+                    exc.status if str(exc.status).isdigit() else 502, msg, etype)
+            except Exception as exc:
+                record_error(model, 502, str(exc),
+                             elapsed_ms=int((time.time() - t_start) * 1000))
+                return self._error(502, "upstream stream error: %s" % exc)
+            wall = int((time.time() - t_start) * 1000)
+            result = qoder_anthropic.chat_to_messages(chat_obj, model=model)
+            record_usage(model, chat_obj.get("usage"), stream=False,
+                         elapsed_ms=wall, fp=fp, account=account.uid,
+                         effort=usage_ctx.get("effort"),
+                         effort_requested=usage_ctx.get("effort_requested"),
+                         key_id=self._key_id_for_usage())
+            return self._json(200, result)
+
     def _handle_responses(self, payload):
         """Serve /v1/responses by translating to chat completions upstream."""
         session_key = extract_session_key(self.headers, payload)
@@ -6346,11 +7162,13 @@ class Handler(BaseHTTPRequestHandler):
                   "allowed_names": _tool_names_from_payload(chat_req)}
         try:
             req_realm = self._request_realm() or CURRENT_REALM
-            blocked = self._cross_realm_error(chat_req.get("model"), req_realm)
+            usage_ctx = {}          # P1-3：推理档位审计出参（下传给 open_upstream）
+            blocked = self._model_precheck(chat_req.get("model"), req_realm)
             if blocked:
                 return self._error(400, blocked, "invalid_request_error")
             upstream, account, _ = open_upstream(
-                chat_req, session_key=session_key, target_realm=req_realm)
+                chat_req, session_key=session_key, target_realm=req_realm,
+                usage_ctx=usage_ctx)
         except RateLimited as exc:
             t = time.time() - t_start
             record_error(model, 429, exc.detail[:200],
@@ -6415,7 +7233,10 @@ class Handler(BaseHTTPRequestHandler):
                                          elapsed_ms=wall, ttft_ms=first_ms,
                                          gen_ms=(wall - first_ms)
                                          if first_ms is not None else None,
-                                         fp=fp, account=account.uid)
+                                         fp=fp, account=account.uid,
+                                         effort=usage_ctx.get("effort"),
+                                         effort_requested=usage_ctx.get("effort_requested"),
+                                         key_id=self._key_id_for_usage())
                             return
                         except UpstreamStatus as exc:
                             _handle_envelope_account_cooldown(account, exc, model=model, session_key=session_key)
@@ -6436,7 +7257,8 @@ class Handler(BaseHTTPRequestHandler):
                                     # build_qoder_body 只读 messages -> 空会话。
                                     cur2, account, _ = open_upstream(
                                         chat_req, session_key=session_key,
-                                        target_realm=req_realm)
+                                        target_realm=req_realm,
+                                        usage_ctx=usage_ctx)
                                 except Exception as rex:
                                     log("responses reopen failed: %s"
                                         % str(rex)[:160], level="WARN")
@@ -6479,7 +7301,10 @@ class Handler(BaseHTTPRequestHandler):
                              elapsed_ms=wall, ttft_ms=first_ms,
                              gen_ms=(wall - first_ms)
                              if first_ms is not None else None,
-                             fp=fp, account=account.uid)
+                             fp=fp, account=account.uid,
+                             effort=usage_ctx.get("effort"),
+                             effort_requested=usage_ctx.get("effort_requested"),
+                             key_id=self._key_id_for_usage())
                 return
             try:
                 chat_obj, account = aggregate_with_envelope_retry(
@@ -6499,7 +7324,10 @@ class Handler(BaseHTTPRequestHandler):
             wall = int((time.time() - t_start) * 1000)
             result = chat_to_response(chat_obj, model, custom_names, tool_wire)
             record_usage(model, chat_obj.get("usage"), stream=False,
-                         elapsed_ms=wall, fp=fp, account=account.uid)
+                         elapsed_ms=wall, fp=fp, account=account.uid,
+                         effort=usage_ctx.get("effort"),
+                         effort_requested=usage_ctx.get("effort_requested"),
+                         key_id=self._key_id_for_usage())
             return self._json(200, result)
 
     def do_POST(self):
@@ -6523,7 +7351,10 @@ class Handler(BaseHTTPRequestHandler):
         )
         if not is_account_route and path not in (
                 "/v1/chat/completions", "/chat/completions",
-                "/v1/responses", "/responses"):
+                "/v1/responses", "/responses",
+                # Anthropic Messages（task-78 接线）：两条都要进白名单，
+                # 否则会在 404 分支被拦掉（CORS 无需另加，"/v1" 前缀已覆盖）。
+                "/v1/messages", "/v1/messages/count_tokens"):
             if path in ("/v1/completions", "/completions"):
                 # legacy Completions（prompt 而非 messages）本网关不实现：
                 # 明确 404 优于"接受请求却按空会话转发上游"。
@@ -6543,6 +7374,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._handle_accounts(path, payload)
         if path in ("/v1/responses", "/responses"):
             return self._handle_responses(payload)
+        if path in ("/v1/messages", "/v1/messages/count_tokens"):
+            return self._handle_anthropic(path, payload)
 
         # ---- Chat Completions 主链路 ----
         normalize_tool_choice(payload)
@@ -6556,20 +7389,19 @@ class Handler(BaseHTTPRequestHandler):
         session_key = extract_session_key(self.headers, payload)
         fp = prompt_fingerprint(payload.get("messages"))
         t_start = time.time()
-        effort = payload.get("reasoning_effort") or \
-            (payload.get("reasoning") or {}).get("effort") \
-            if isinstance(payload.get("reasoning"), dict) \
-            else payload.get("reasoning_effort")
+        effort = requested_effort(payload)   # 与 usage 记账、请求体构造同源
         log("chat: model=%s client_effort=%r stream=%s msgs=%d"
             % (model, effort, want_stream,
                len(payload.get("messages") or [])))
         try:
             req_realm = self._request_realm() or CURRENT_REALM
-            blocked = self._cross_realm_error(model, req_realm)
+            usage_ctx = {}          # P1-3：推理档位审计出参（下传给 open_upstream）
+            blocked = self._model_precheck(model, req_realm)
             if blocked:
                 return self._error(400, blocked, "invalid_request_error")
             upstream, account, _ = open_upstream(payload, session_key=session_key,
-                                                 target_realm=req_realm)
+                                                 target_realm=req_realm,
+                                                 usage_ctx=usage_ctx)
         except RateLimited as exc:
             record_error(model, 429, exc.detail[:200],
                          elapsed_ms=int((time.time() - t_start) * 1000))
@@ -6628,7 +7460,10 @@ class Handler(BaseHTTPRequestHandler):
                                          elapsed_ms=wall, ttft_ms=first_ms,
                                          gen_ms=(wall - first_ms)
                                          if first_ms is not None else None,
-                                         fp=fp, account=account.uid)
+                                         fp=fp, account=account.uid,
+                                         effort=usage_ctx.get("effort"),
+                                         effort_requested=usage_ctx.get("effort_requested"),
+                                         key_id=self._key_id_for_usage())
                             return
                         except UpstreamStatus as exc:
                             _handle_envelope_account_cooldown(account, exc, model=model, session_key=session_key)
@@ -6643,7 +7478,8 @@ class Handler(BaseHTTPRequestHandler):
                                 try:
                                     cur2, account, _ = open_upstream(
                                         payload, session_key=session_key,
-                                        target_realm=req_realm)
+                                        target_realm=req_realm,
+                                        usage_ctx=usage_ctx)
                                 except Exception as rex:
                                     log("chat reopen failed: %s"
                                         % str(rex)[:160], level="WARN")
@@ -6692,7 +7528,10 @@ class Handler(BaseHTTPRequestHandler):
                              elapsed_ms=wall, ttft_ms=first_ms,
                              gen_ms=(wall - first_ms)
                              if first_ms is not None else None,
-                             fp=fp, account=account.uid)
+                             fp=fp, account=account.uid,
+                             effort=usage_ctx.get("effort"),
+                             effort_requested=usage_ctx.get("effort_requested"),
+                             key_id=self._key_id_for_usage())
                 return
             try:
                 result, account = aggregate_with_envelope_retry(
@@ -6721,7 +7560,10 @@ class Handler(BaseHTTPRequestHandler):
             record_usage(model, result.get("usage"), stream=False,
                          elapsed_ms=wall, ttft_ms=first_ms,
                          gen_ms=(wall - first_ms) if first_ms is not None else None,
-                         fp=fp, account=account.uid)
+                         fp=fp, account=account.uid,
+                         effort=usage_ctx.get("effort"),
+                         effort_requested=usage_ctx.get("effort_requested"),
+                         key_id=self._key_id_for_usage())
             return self._json(200, result)
 
 
@@ -6843,6 +7685,13 @@ def main():
     POOL = qoder_accounts.AccountPool(ACCOUNTS_DIR, log=log)
     POOL.load()
     load_persisted_realm()
+    # task-61：把设置里的护栏阈值 + free 名单**同批**推给池（R3）；阈值全 0 时
+    # 不产生任何副作用，任一 > 0 则惰性启动后台上新线程（G1 的恢复路径）。
+    try:
+        POOL.apply_settings(limits_data=qoder_settings.limits_data(ACCOUNTS_DIR),
+                            free_models=free_model_names(CURRENT_REALM))
+    except Exception as exc:
+        log("quota limits apply failed at startup: %s" % exc, level="WARN")
     from qoder_scheduler import Scheduler
     SCHEDULER = Scheduler(POOL)
     SCHEDULER.start()

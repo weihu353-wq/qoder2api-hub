@@ -7,10 +7,12 @@ password is never stored in clear text - only a PBKDF2-SHA256 digest.
 Only the Python standard library is required.
 """
 
+import fnmatch
 import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import threading
 import time
@@ -167,6 +169,9 @@ def _clean_key_entry(entry):
         "realm": realm,
         "enabled": entry.get("enabled", True) is not False,
         "created_at": entry.get("created_at") or time.strftime("%Y/%m/%d %H:%M"),
+        # P1-4：每 Key 模型白名单（空列表 = 不限制）。**必须显式保留**——
+        # 本函数是白名单式重建，漏掉即「保存时被静默丢弃」（limits 同型坑）。
+        "models": _clean_model_patterns(entry.get("models")),
     }
 
 
@@ -262,6 +267,66 @@ def set_auth_disabled(accounts_dir, disabled):
         save(accounts_dir, data)
 
 
+# ------------------------------------------------------------- model gates
+# P1-4：模型闸门配置层。全局封禁（banned_models）与每 Key 白名单（key 条目的
+# models 字段）共用同一套 pattern 清洗与匹配：fnmatch 通配、大小写不敏感；
+# **默认空 = 不封禁 / 不限制**（未碰这两个配置的安装行为与改动前一致）。
+_MODEL_SPLIT = re.compile(r"[,;\n]")
+
+
+def _clean_model_patterns(value):
+    """把 字符串 / 列表 / 集合 清洗成 pattern 列表（strip+lower+去重+去空）。
+
+    非法类型返回 []（fail-open：读配置永远不抛）。
+    """
+    if isinstance(value, str):
+        raw = _MODEL_SPLIT.split(value)
+    elif isinstance(value, (list, tuple, set)):
+        raw = list(value)
+    else:
+        return []
+    out = []
+    for item in raw:
+        pattern = str(item or "").strip().lower()
+        if pattern and pattern not in out:
+            out.append(pattern)
+    return out
+
+
+def key_allows_model(entry, model):
+    """True = 该 Key 未设模型限制，或 model 命中它的 models 列表。
+
+    - 空列表（或字段缺失）= 不受限（未碰过这个字段的安装行为不变）；
+    - 受限 Key 且 model 为空 = **拒绝**（wb 同语义：空模型没有可判定依据，
+      放行只会带着空模型白跑一趟上游）；
+    - 匹配 fnmatch（大小写已在清洗时统一为小写），支持 gpt-4* 这类通配。
+    """
+    patterns = _clean_model_patterns((entry or {}).get("models"))
+    if not patterns:
+        return True
+    name = str(model or "").strip().lower()
+    if not name:
+        return False
+    return any(fnmatch.fnmatchcase(name, pattern) for pattern in patterns)
+
+
+def banned_models(accounts_dir):
+    """全局封禁的模型 pattern 列表（settings 键 banned_models；默认空）。"""
+    with _lock:
+        raw = load(accounts_dir).get("banned_models")
+    return _clean_model_patterns(raw)
+
+
+def set_banned_models(accounts_dir, value):
+    """落盘全局封禁列表（清洗后存储；空 = 不封禁任何模型）。返回清洗结果。"""
+    patterns = _clean_model_patterns(value)
+    with _lock:
+        data = load(accounts_dir)
+        data["banned_models"] = patterns
+        save(accounts_dir, data)
+    return patterns
+
+
 class PanelSessions(object):
     """In-memory bearer tokens handed out after a successful panel login.
 
@@ -301,3 +366,123 @@ class PanelSessions(object):
     def revoke_all(self):
         with self._lock:
             self._tokens.clear()
+
+
+# ---------------------------------------------------------------- limits
+# 四个守卫共享同一形状：一个覆盖双区域的 global 默认值 + 可选的 per-realm
+# override。**留空 = 继承 global**（与显式 0 = "关闭"严格区分）；从不碰这份
+# 配置的安装，行为与没有它完全一致。形状照抄 wb_settings.py 的三条读/写入口
+# + 分组 map，但 qoder 侧 **默认值全部为 0（关闭）**——量纲尚未核对
+# （.team/_gap/03-candidate-deep-dive.md R4），不给任何非零默认。
+LIMIT_KEYS = ("reserve_credits", "daily_token_limit",
+              "daily_credit_limit", "model_daily_token_limit",
+              "expiring_window_days")
+LIMIT_REALMS = ("intl", "cn")
+LIMIT_SCOPES = ("global",) + LIMIT_REALMS
+LIMITS_KEY = "limits"
+
+
+def _empty_limit_entry():
+    """一个守卫的空条目：global 默认 0（关），两个 realm 槽位 None=继承。"""
+    return {"global": 0, "intl": None, "cn": None}
+
+
+def _coerce_global(value):
+    """global 阈值：垃圾值与负数收敛到 0（关）。"""
+    try:
+        number = int(value or 0)
+    except (TypeError, ValueError):
+        number = 0
+    return max(0, number)
+
+
+def _coerce_override(value):
+    """per-realm override：None/空串="继承 global"（与显式 0="本区域关闭"不同）。"""
+    if value is None or value == "":
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return max(0, number)
+
+
+def _normalize_limits(raw):
+    """把存储的 map 补全成完整形状（部分/手改的 settings.json 也安全读）。"""
+    limits = {}
+    for key in LIMIT_KEYS:
+        entry = raw.get(key)
+        if not isinstance(entry, dict):
+            entry = {}
+        global_raw = entry.get("global")
+        # 缺省 global → 0（关）；显式 0 是真实的"关"，不会被误重新打开。
+        limits[key] = {
+            "global": 0 if global_raw is None else _coerce_global(global_raw),
+            "intl": _coerce_override(entry.get("intl")),
+            "cn": _coerce_override(entry.get("cn")),
+        }
+    return limits
+
+
+def limits_data(accounts_dir):
+    """分组后的 limits map（每个守卫都补全为完整形状）。
+
+    qoder 从未有过旧扁平键，因此不做 wb 的 _fold_legacy_limits 迁移分支。
+    """
+    with _lock:
+        raw = load(accounts_dir).get(LIMITS_KEY)
+        return _normalize_limits(raw if isinstance(raw, dict) else {})
+
+
+def limit_value(accounts_dir, key, realm=None):
+    """单守卫、单区域的**生效值**。
+
+    realm 为 intl/cn 且有 override 时用 override，否则回落 global；
+    未知 key 读作 0（关），不卡请求路径（与 wb 同语义）。
+    """
+    entry = limits_data(accounts_dir).get(key) or _empty_limit_entry()
+    if realm in LIMIT_REALMS:
+        override = entry.get(realm)
+        if override is not None:
+            return override
+    return entry.get("global") or 0
+
+
+def limit_values(accounts_dir, key):
+    """单守卫 → {"global": g, "intl": ..., "cn": ...}（intl/cn 已把 global 填好）。
+
+    热路径上每个账号按自己的 realm 取一次即可；保证三键齐全且 intl/cn 非
+    None（验收 A5）。
+    """
+    entry = limits_data(accounts_dir).get(key) or _empty_limit_entry()
+    global_value = entry.get("global") or 0
+    values = {"global": global_value}
+    for realm in LIMIT_REALMS:
+        override = entry.get(realm)
+        values[realm] = global_value if override is None else override
+    return values
+
+
+def set_limit(accounts_dir, key, scope, value):
+    """落盘单个守卫的单个作用域；返回该守卫的完整条目。
+
+    key 不在 LIMIT_KEYS、scope 不在 LIMIT_SCOPES 时抛 ValueError；
+    scope="global" 恒存数字（None/垃圾→0）；intl/cn 传 None/空串 =
+    清除 override 回到继承。
+    """
+    if key not in LIMIT_KEYS:
+        raise ValueError("unknown limit: %s" % key)
+    if scope not in LIMIT_SCOPES:
+        raise ValueError("unknown scope: %s" % scope)
+    with _lock:
+        data = load(accounts_dir)
+        raw = data.get(LIMITS_KEY)
+        limits = _normalize_limits(raw if isinstance(raw, dict) else {})
+        entry = limits[key]
+        if scope == "global":
+            entry["global"] = _coerce_global(value)
+        else:
+            entry[scope] = _coerce_override(value)
+        data[LIMITS_KEY] = limits
+        save(accounts_dir, data)
+    return entry

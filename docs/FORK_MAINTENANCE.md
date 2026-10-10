@@ -2,9 +2,10 @@
 
 仓库：[weihu353-wq/qoder2api-hub](https://github.com/weihu353-wq/qoder2api-hub)。
 上游：[shuishuipingan/qoder2api-hub](https://github.com/shuishuipingan/qoder2api-hub)。
-初始基线：v1.2.17 / `a2aef03110f3bd603f1a17de6e25e0ff77cc3537`，2026-10-05。
-首版改进日期：2026-10-06（Asia/Shanghai）。保留上游 MIT 许可与作者说明。
-个人版本标识：`1.2.17-codex.1`。运行时版本用于区分上游基线与本分支。
+当前上游基线：v1.3.4 / `ae31046ba387392ff6dcc4170a978081c409fdfb`，2026-10-10。
+个人维护补丁始于 v1.2.17 / `a2aef03110f3bd603f1a17de6e25e0ff77cc3537`（2026-10-05）；
+本次整合保留其协议与调度不变量，并保留上游 MIT 许可与作者说明。
+个人版本标识：`1.3.4-codex.1`。运行时版本用于区分上游基线与本分支。
 完整改动清单见 [个人维护版变更](CHANGELOG_MAINTAINED.md)。
 
 ## 维护范围

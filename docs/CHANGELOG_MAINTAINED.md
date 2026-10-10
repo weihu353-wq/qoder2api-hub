@@ -1,5 +1,18 @@
 # 个人维护版变更
 
+## 1.3.4-codex.1 — 2026-10-10
+
+基于 upstream v1.3.4 / `ae31046`，合并其原生 Anthropic 入口、额度与模型护栏、
+按 API Key 的用量维度、测试套件和镜像构建修复。
+
+保留本维护分支已验证的 Responses function/custom/namespace 转换、稳定的流式与
+最终 item/call ID、首帧参数分片、截断工具调用的 incomplete 终态，以及北京时间
+10:00 的有界签到、跨重启状态与调度器交接修复。非流式 Responses 同时保留
+namespace wire-map 还原和上游新增的 effort/key 用量记录。
+
+统一离线入口继续使用临时账号与流水目录、禁用调度和桌面发现，并额外跳过仅用于
+本机环境冒烟的桌面凭据扫描；该跳过不计为通过。
+
 ## 1.2.17-codex.1 — 2026-10-06
 
 基于 upstream v1.2.17 / `a2aef031`。

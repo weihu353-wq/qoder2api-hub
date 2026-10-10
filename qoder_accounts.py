@@ -13,6 +13,7 @@
   - 账号导入导出（Dry-Run 预检）与 JSON 持久化（原子写）
 """
 import base64
+import collections
 import datetime
 import ipaddress
 import json
@@ -876,6 +877,154 @@ def next_checkin_window(now=None):
 
 
 # ---------------------------------------------------------------------------
+# 账号级预算护栏（task-61）：常量 + 当日用量折叠
+# ---------------------------------------------------------------------------
+# 设计来源：.team/_gap/03-candidate-deep-dive.md（wb 六个守卫的等价移植）。
+# 四条护栏 G1 余额地板 / G2 当日 token / G3 当日 credit（free 豁免）/
+# G4 单模型当日 token —— 全部**纯内存读**（R1，ready() 在选号热路径上），
+# 阈值默认 0 = 关闭（R4：量纲未核对，上线由使用方显式开）。
+_QUOTA_LOCK = threading.Lock()          # R6：限额字段专用锁（不是 _SAVE_LOCK）
+
+# ---------------------------------------------------------------------------
+# 账号级失败治理（task-74）：软限流退避 / 硬错误熔断 / 未知错误降权
+# ---------------------------------------------------------------------------
+# 移植自 wb_accounts.py:376-411（三族 + 常量）。**不另起冷却系统**：
+#   · note_soft_rate 复用 cooldown_until（与普通冷却同字段、同判定路径）；
+#   · note_failure / note_unknown_failure 各占一个新窗口字段，但在
+#     ready() / throttle_wait() 里与既有冷却**同一处**取用（不是并行判定）；
+#   · 全部状态读写走同一把 _QUOTA_LOCK（与护栏同锁；不用 _SAVE_LOCK 文件锁）。
+# 复位路径（每族）见各方法 docstring；统一入口 Account.note_success()。
+SOFT_RATE_BASE = 600.0          # 账号级 429 首次退避：10 分钟
+SOFT_RATE_MAX = 7200.0          # …按 2 的幂翻倍，封顶 2 小时
+BREAKER_THRESHOLD = 3           # 连续硬失败达到该次数才起跳熔断
+BREAKER_COOLDOWN = 1800.0       # 首次熔断窗口：30 分钟
+BREAKER_COOLDOWN_MAX = 21600.0  # …封顶 6 小时
+DEGRADE_THRESHOLD = 5           # 连续未知失败达到该次数才降权
+DEGRADE_COOLDOWN = 600.0        # 首次降权窗口：10 分钟
+DEGRADE_COOLDOWN_MAX = 7200.0   # …封顶 2 小时
+
+
+def _exponential_backoff(count, base, cap, offset):
+    """base * 2 ** (count - offset)，封顶 cap、最多放大 20 步（wb:391 同式）。"""
+    step = max(0, int(count) - int(offset))
+    return min(float(base) * (2 ** min(step, 20)), float(cap))
+
+
+def soft_backoff(streak):
+    """连续 streak 次软限流对应的退避秒数。"""
+    return _exponential_backoff(streak, SOFT_RATE_BASE, SOFT_RATE_MAX, 1)
+
+
+def breaker_backoff(fails):
+    """连续 fails 次硬失败对应的熔断窗口秒数。"""
+    return _exponential_backoff(fails, BREAKER_COOLDOWN, BREAKER_COOLDOWN_MAX,
+                                BREAKER_THRESHOLD)
+
+
+def degrade_backoff(fails):
+    """连续 fails 次未知失败对应的降权窗口秒数。"""
+    return _exponential_backoff(fails, DEGRADE_COOLDOWN, DEGRADE_COOLDOWN_MAX,
+                                DEGRADE_THRESHOLD)
+
+
+def _scope_limit_value(scope, realm):
+    """三级作用域取值：realm override > global > 0（与 qoder_settings.limit_value 同语义）。
+
+    也接受扁平数值，便于调用方直接给标量。非法/负数一律归 0（= 关闭该护栏）。
+    """
+    val = scope
+    if isinstance(scope, dict):
+        val = scope.get(realm)
+        if val is None:
+            val = scope.get("global")
+    if val is None:
+        return 0
+    try:
+        return max(0, int(val))
+    except (TypeError, ValueError):
+        return 0
+DEFAULT_CREDITS_REFRESH_HOURS = 12.0    # §2.5：与 wb 同默认
+_QUOTA_REFRESHER_INTERVAL = 1800        # 每 tick 只刷一个账号 -> 每天 ≤48 次计费调用
+_QUOTA_REFRESHER_PARK = 6 * 3600        # 刷新失败的账号停放 6h（§2.5）
+
+
+# 测试/CLI 可显式指定 usage.jsonl（优先于环境变量）：注入夹具用。
+# 生产链路（CreditsRefresher -> refresh_daily_usage()）走 QD_PROXY_USAGE_DIR，
+# 与 qoder_proxy.USAGE_DIR 同源；唯一例外是 proxy 的 --usage-dir（只改 proxy 侧）。
+USAGE_LOG_OVERRIDE = None
+# 9999-12-31T00:00:00Z：官方给 CN 号的「永不过期」占位值（质检 E4 实测）——
+# 临期权重与 soonest_expiring_days 必须跳过它，否则 CN 号会被算成"很久以后到期"。
+_EXPIRY_NEVER_EPOCH = 253402214400
+
+
+def usage_log_path():
+    """usage.jsonl 的路径。
+
+    优先级：USAGE_LOG_OVERRIDE（显式注入，测试/CLI）> QD_PROXY_USAGE_DIR
+    > 本文件目录下的 usage/（与 qoder_proxy 的默认值一致）。
+    """
+    if USAGE_LOG_OVERRIDE:
+        return str(USAGE_LOG_OVERRIDE)
+    d = os.environ.get("QD_PROXY_USAGE_DIR") or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "usage")
+    return os.path.join(d, "usage.jsonl")
+
+
+def fold_daily_usage(log_path=None, day=None, max_lines=200000):
+    """折叠「当日、按 uid」的 token / credit（只读本地 usage.jsonl，**不联网**）。
+
+    返回 {"day", "tokens"{uid:int}, "credits"{uid:float},
+          "model_tokens"{uid:{model:int}}, "rows", "skipped"}。
+    · 跨日自动归零：只统计 iso 日期 == day 的行（新的一天 -> 新桶）。
+    · 文件缺失/不可读 -> 空桶（不是 None）；调用方据此把「有账号但今日无记录」
+      折叠为 0（D4：默认 0 而不是 None，避免当天没流量的号永远 fail-open）。
+    · max_lines 只保留文件末尾 N 行（大日志保护）。
+    """
+    day = day or time.strftime("%Y-%m-%d")
+    out = {"day": day, "tokens": {}, "credits": {}, "model_tokens": {},
+           "rows": 0, "skipped": 0}
+    path = log_path or usage_log_path()
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            keep = int(max_lines) if max_lines and int(max_lines) > 0 else None
+            tail = collections.deque(fh, maxlen=keep)
+    except Exception:
+        return out
+    for line in tail:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except Exception:
+            out["skipped"] += 1
+            continue
+        if not isinstance(row, dict) or row.get("error"):
+            continue
+        if str(row.get("iso") or "")[:10] != day:
+            continue
+        uid = str(row.get("account") or "")
+        try:
+            tokens = int(row.get("total_tokens") or 0)
+        except (TypeError, ValueError):
+            tokens = 0
+        try:
+            credit = float(row.get("credit") or 0)
+        except (TypeError, ValueError):
+            credit = 0.0
+        out["rows"] += 1
+        if not uid:
+            continue
+        out["tokens"][uid] = out["tokens"].get(uid, 0) + tokens
+        out["credits"][uid] = round(out["credits"].get(uid, 0.0) + credit, 6)
+        model = str(row.get("model") or "")
+        if model:
+            per = out["model_tokens"].setdefault(uid, {})
+            per[model] = per.get(model, 0) + tokens
+    return out
+
+
+# ---------------------------------------------------------------------------
 # 带重试的 HTTP JSON 工具
 # ---------------------------------------------------------------------------
 # 198.18.0.0/15 (RFC 2544 benchmarking) 与 fdfe:dcba:9876::/48 被 Clash/mihomo
@@ -1014,6 +1163,24 @@ class Account(object):
         # 按模型粒度的限流冷却：上游频控只针对单模型，不能拖垮整个账号。
         self.model_cooldowns = {}
         self.credits = data.get("credits") or None
+        # ---- task-61：账号级预算护栏状态（默认全关；计数 None = 未知 -> fail-open）----
+        self.reserve_credits = 0            # G1 余额地板（<=0 关）
+        self.daily_token_limit = 0          # G2 当日 token 总额（<=0 关）
+        self.daily_tokens_today = None      # None = 未折叠 -> 放行
+        self.daily_credit_limit = 0         # G3 当日 credit 总额（<=0 关）
+        self.daily_credits_today = None
+        self.model_daily_token_limit = 0    # G4 单模型当日 token（<=0 关）
+        self.model_daily_tokens = {}        # {model: tokens}
+        self.free_models = frozenset()      # 目录 is_free 名单（与守卫同批推送，R3）
+        self.expiring_window_days = 0       # R7：即将过期窗口（天），默认 0 = 关
+        self.balance_until = 0.0            # 402 停放（时钟 = UTC+8 每日 10:00，R5）
+        self.balance_reason = ""
+        # task-74 失败治理三族（运行期状态，重启重置）：
+        self.soft_streak = 0                # 连续软限流（429）计数，喂 cooldown_until
+        self.fails = 0                      # 连续硬失败计数（喂熔断）
+        self.degrade_count = 0              # 连续未知失败计数
+        self.breaker_until = 0.0            # 硬错误熔断窗口截止（ready() 会挡）
+        self.degrade_until = 0.0            # 未知错误降权窗口截止（不挡 ready）
         self.plan = str(data.get("plan") or "")
         self.last_checkin = data.get("lastCheckin") or None
         self.last_checkin_window = str(data.get("lastCheckinWindow") or "")
@@ -1091,6 +1258,25 @@ class Account(object):
             "addedAt": self.added_at,
             "file": os.path.basename(self.path) if self.path else None,
             "credits": self.credits,
+            # task-61 护栏状态（面板三态：没开 / 开了但未知 / 已超额）
+            "reserveCredits": self.reserve_credits,
+            "reserveBlocked": self.reserve_blocked(),
+            "dailyTokenLimit": self.daily_token_limit,
+            "dailyTokensToday": self.daily_tokens_today,
+            "dailyLimitBlocked": self.daily_limit_blocked(),
+            "dailyCreditLimit": self.daily_credit_limit,
+            "dailyCreditsToday": self.daily_credits_today,
+            "creditLimitReached": self.credit_limit_reached(),
+            "modelTokenBlocked": sorted(self.blocked_model_names()),
+            "freeModelCount": len(self.free_models or ()),
+            "expiringWindowDays": self.expiring_window_days,
+            "expiringSoonDays": self.soonest_expiring_days(),
+            "inExpiringWindow": self.in_expiring_window(),
+            "balanceParked": self.balance_until > time.time(),
+            "balanceUntil": self.balance_until or None,
+            "softStreak": int(self.soft_streak),
+            "breakerFor": round(max(0.0, self.breaker_until - time.time())) or None,
+            "degradeFor": round(max(0.0, self.degrade_until - time.time())) or None,
             "plan": self.plan,
             "lastCheckin": self.last_checkin,
             # 运行时探测：None=未探测（照常尝试）/ True / False（本区域无接口）
@@ -1133,6 +1319,20 @@ class Account(object):
             return False
         if model and self.model_cooldowns.get(model, 0.0) > time.time():
             return False
+        # ---- task-61：账号级预算护栏（纯内存读，无网络分支；R1）----
+        if self.balance_until > time.time():       # 402 停放（UTC+8 10:00 解封）
+            return False
+        if self.breaker_until > time.time():       # task-74 硬错误熔断窗口（自动恢复）
+            return False
+        if self.reserve_blocked():                 # G1 余额地板
+            return False
+        if self.daily_limit_blocked():             # G2 当日 token 总额
+            return False
+        if self.credit_limit_blocked(model):       # G3 当日 credit（free 豁免）
+            return False
+        if self.model_token_limit_blocked(model):  # G4 单模型当日 token
+            return False
+        # ---- 护栏结束（下面才是 token 过期 -> refresh 的最后手段）----
         exp = self.expires_at
         if not exp:
             return True
@@ -1143,6 +1343,201 @@ class Account(object):
             self.refresh()
             return True
         return self.refresh()
+
+    # -- 账号级预算护栏（task-61，全部纯内存读）------------------------------
+    def reserve_blocked(self):
+        """G1 余额地板：remain <= reserve 即停（含等号）。三道短路 -> 放行。"""
+        reserve = self.reserve_credits
+        if not reserve or reserve <= 0:
+            return False
+        cred = self.credits
+        if not isinstance(cred, dict):
+            return False
+        remain = cred.get("remain")
+        if remain is None:
+            return False
+        try:
+            return int(float(remain)) <= int(reserve)
+        except (TypeError, ValueError):
+            return False
+
+    def daily_limit_blocked(self):
+        """G2 当日 token 总额。计数 None = 未折叠 -> fail-open（R2）。"""
+        limit = self.daily_token_limit
+        if not limit or limit <= 0:
+            return False
+        used = self.daily_tokens_today
+        if used is None:
+            return False
+        try:
+            return int(used) >= int(limit)
+        except (TypeError, ValueError):
+            return False
+
+    def model_is_free(self, model):
+        """目录 is_free 名单命中（空 model 恒 False）。"""
+        return bool(model) and model in (self.free_models or ())
+
+    def credit_limit_reached(self):
+        """G3a 当日 credit 总额（账号级事实，与模型无关）。"""
+        limit = self.daily_credit_limit
+        if not limit or limit <= 0:
+            return False
+        used = self.daily_credits_today
+        if used is None:
+            return False
+        try:
+            return float(used) >= float(limit)
+        except (TypeError, ValueError):
+            return False
+
+    def credit_limit_blocked(self, model=None):
+        """G3 当日 credit 的模型感知包装：额度爆了免费模型照跑（唯一反向条件）。"""
+        if not model or self.model_is_free(model):
+            return False
+        return self.credit_limit_reached()
+
+    def model_token_limit_blocked(self, model=None):
+        """G4 单模型当日 token 额。"""
+        limit = self.model_daily_token_limit
+        if not limit or limit <= 0 or not model:
+            return False
+        per = self.model_daily_tokens
+        if not isinstance(per, dict):
+            return False
+        used = per.get(model)
+        if used is None:
+            return False
+        try:
+            return int(used) >= int(limit)
+        except (TypeError, ValueError):
+            return False
+
+    def blocked_model_names(self):
+        """当前超额的模型名集合（只服务日志：状态翻转才打印）。"""
+        limit = self.model_daily_token_limit
+        if not limit or limit <= 0 \
+                or not isinstance(self.model_daily_tokens, dict):
+            return set()
+        out = set()
+        for name, used in self.model_daily_tokens.items():
+            try:
+                if int(used) >= int(limit):
+                    out.add(name)
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    def soonest_expiring_days(self, now=None):
+        """「还有余额、最早到期」的积分包剩余天数；无法判断返回 None。
+
+        数据源：self.credits["packages"]（fetch_credits 写入）。每包支持：
+          · `days_left`（数值，直接给，优先）；
+          · `expires_at` / `expireAt`（epoch，现算 (exp-now)/86400）。
+        跳过：no_expiry / package_code == "enterprise"（企业额度是重置不是作废）/
+        is_expired；只接受 days_left >= 0 且 remain > 0 的包。
+        未知数据永不构成偏好（R7：expiring_window_days 默认 0 = 关闭）。
+
+        S1 实测（2026-10）：上游 /quota/usage 的 userQuota / addOnQuota 内部
+        **没有**任何到期字段——真正的到期只有响应**顶层** expiresAt（已原样存
+        在 credits["expires_at"]；其归属未经证实，故不映射到包级：误贴会把
+        「按月重置」的额度算成临期、反向消耗）。因此在真实数据上本函数恒返回
+        None = 偏好不触发（安全侧）；fetch_credits 已对未来的包级到期字段做
+        透传，上游一补就自动生效（回归守卫见 tests/_test_credit_expiry.py）。
+        """
+        cred = self.credits
+        if not isinstance(cred, dict):
+            return None
+        packages = cred.get("packages")
+        if not isinstance(packages, list):
+            return None
+        now = now if now is not None else time.time()
+        best = None
+        for pkg in packages:
+            if not isinstance(pkg, dict):
+                continue
+            if pkg.get("no_expiry"):
+                continue
+            if str(pkg.get("package_code") or "").lower() == "enterprise":
+                continue
+            if pkg.get("is_expired"):
+                continue
+            try:
+                remain = float(pkg.get("remain") or 0)
+            except (TypeError, ValueError):
+                remain = 0.0
+            if remain <= 0:
+                continue
+            days = pkg.get("days_left")
+            if days is None:
+                exp = pkg.get("expires_at")
+                if exp is None:
+                    exp = pkg.get("expireAt")
+                if exp is None:
+                    continue                    # 该包无法判断 -> 不参与
+                try:
+                    exp_f = float(exp)
+                except (TypeError, ValueError):
+                    continue
+                if exp_f >= _EXPIRY_NEVER_EPOCH:
+                    continue        # 永不过期占位（CN 号 253402214400）-> 不参与
+                days = (exp_f - now) / 86400.0
+            try:
+                days = float(days)
+            except (TypeError, ValueError):
+                continue
+            if days < 0:
+                continue
+            if best is None or days < best:
+                best = days
+        return best
+
+    def in_expiring_window(self, now=None):
+        """是否落在「即将过期」窗口内（window <= 0 直接 False 短路）。"""
+        window = self.expiring_window_days
+        if not window or window <= 0:
+            return False
+        soonest = self.soonest_expiring_days(now=now)
+        return soonest is not None and soonest <= float(window)
+
+    def quota_blocked(self, model=None):
+        """四条护栏的汇总：返回命中的那条（""=未命中）。面板用。"""
+        if self.reserve_blocked():
+            return "reserve"
+        if self.daily_limit_blocked():
+            return "daily_tokens"
+        if self.credit_limit_blocked(model):
+            return "daily_credits"
+        if self.model_token_limit_blocked(model):
+            return "model_tokens"
+        return ""
+
+    def note_balance_cooled(self, detail="", until=None):
+        """402 停放：停到**本仓的额度重置窗口**（UTC+8 每日 10:00，R5）。
+
+        与 G1 是两套机制（G1 预防性、无时钟；这里事后停放）。短冷却无意义——
+        额度每日重置，几分钟后放出去只会再撞一次 402。
+        """
+        deadline = float(until) if until else float(next_checkin_window()[0])
+        if deadline > self.balance_until:
+            self.balance_until = deadline
+        self.balance_reason = str(detail or "")[:200]
+        return self.balance_until
+
+    def revive_balance_cooldown(self):
+        """只有**余额刷新看到 remain > 0** 才解 402 停放（不是通用 clear_error）。"""
+        if not self.balance_until:
+            return False
+        cred = self.credits
+        remain = cred.get("remain") if isinstance(cred, dict) else None
+        try:
+            if remain is None or float(remain) <= 0:
+                return False
+        except (TypeError, ValueError):
+            return False
+        self.balance_until = 0.0
+        self.balance_reason = ""
+        return True
 
     def note_error(self, message, cooldown=60, single_account=False, model=None, until=None):
         self.last_error = str(message)[:200]
@@ -1159,7 +1554,8 @@ class Account(object):
         if not self.enabled or not self.access_token:
             return 0.0
         now = time.time()
-        wait = max(0.0, self.cooldown_until - now)
+        wait = max(0.0, self.cooldown_until - now,
+                   self.breaker_until - now)
         if model:
             wait = max(wait, max(0.0, self.model_cooldowns.get(model, 0.0) - now))
         return wait
@@ -1172,6 +1568,90 @@ class Account(object):
         if self.last_error or self.cooldown_until:
             self.last_error = ""
             self.cooldown_until = 0
+
+    # -- 失败治理三族（task-74；状态写入统一走 _QUOTA_LOCK）------------------
+    def note_soft_rate(self, message):
+        """三族一：账号级软限流（429 类）→ 指数退避，复用 cooldown_until。
+
+        第 n 次连续软限流退避 min(600 * 2^(n-1), 7200) 秒（封顶 2 小时）。
+        复位：note_success() 立即清零；或退避自然到期。退避不是封禁——本方
+        法绝不改 enabled，账号只是稍后再试。
+        """
+        with _QUOTA_LOCK:
+            self.last_error = str(message)[:200]
+            self.soft_streak += 1
+            wait = soft_backoff(self.soft_streak)
+            deadline = time.time() + wait
+            if deadline > self.cooldown_until:
+                self.cooldown_until = deadline
+        return wait
+
+    def note_failure(self, message):
+        """三族二：硬错误熔断——连续 >= BREAKER_THRESHOLD 次才起跳窗口。
+
+        窗口期间 ready() 直接 False（不再重试）；窗口过后自动恢复（连续失败
+        越多窗口越长，封顶 6 小时）。复位：note_success() 清计数与窗口。
+        注意：凭证永久失效（session dead）仍走既有 enabled=False 路径，不是
+        本族——那是必须重新登录，不是稍后自愈。
+        """
+        with _QUOTA_LOCK:
+            self.last_error = str(message)[:200]
+            self.fails += 1
+            if self.fails >= BREAKER_THRESHOLD:
+                wait = breaker_backoff(self.fails)
+                deadline = time.time() + wait
+                if deadline > self.breaker_until:
+                    self.breaker_until = deadline
+        return self.breaker_until
+
+    def note_unknown_failure(self, message):
+        """三族三：未知错误降权窗口——不是不可用。
+
+        连续 >= DEGRADE_THRESHOLD 次后进入降权窗口：ready() 不受影响（账号仍
+        可用），但 AccountPool._rotate_pick 两轮扫描会先跳过降权中的账号，只
+        有没有更健康候选时才回落使用它（不楔死）。同时喂熔断计数（未知也可
+        能真是硬错误）。复位：note_success() 清零；窗口自然到期隐式恢复。
+        """
+        with _QUOTA_LOCK:
+            self.last_error = str(message)[:200]
+            self.degrade_count += 1
+            self.fails += 1
+            now = time.time()
+            if self.degrade_count >= DEGRADE_THRESHOLD:
+                wait = degrade_backoff(self.degrade_count)
+                deadline = now + wait
+                if deadline > self.degrade_until:
+                    self.degrade_until = deadline
+            if self.fails >= BREAKER_THRESHOLD:
+                wait = breaker_backoff(self.fails)
+                deadline = now + wait
+                if deadline > self.breaker_until:
+                    self.breaker_until = deadline
+        return self.degrade_until
+
+    def degraded(self, now=None):
+        """是否处于降权窗口（供选号排序降权；非阻断，不参与 ready）。"""
+        now = now if now is not None else time.time()
+        return self.degrade_until > now
+
+    def note_success(self, model=None):
+        """一次成功请求清空全部账号级惩罚（三族计数 + 软冷却 + 模型冷却）。
+
+        三族的统一复位入口：成功后 soft_streak / fails / degrade_count 归零、
+        breaker / degrade 窗口清零。刻意不动 balance_until——402 停放专属，
+        只由 revive_balance_cooldown() 在余额刷新看到 remain>0 时解除（两套
+        机制不合并，见 03 文档 2.9.4 的移植约定）。
+        """
+        with _QUOTA_LOCK:
+            if model:
+                self.model_cooldowns.pop(model, None)
+            self.soft_streak = 0
+            self.fails = 0
+            self.degrade_count = 0
+            self.breaker_until = 0.0
+            self.degrade_until = 0.0
+            self.last_error = ""
+            self.cooldown_until = 0.0
 
     # -- 出站头 ------------------------------------------------------------
     def headers(self, purpose="openapi"):
@@ -1871,6 +2351,33 @@ class Account(object):
             except Exception:
                 return 0.0
 
+        def _expiry_of(src):
+            """把上游额度对象里的到期信息**防御性透传**进 packages（存在才写）。
+
+            S1 实测（2026-10）：上游 userQuota / addOnQuota 内部**没有**任何
+            到期字段，只有响应顶层 expiresAt（归属未证实，刻意不映射到包级——
+            误贴会把「按月重置」的额度算成临期，反向消耗）。本函数只做透传、
+            不臆造：哪天上游补上 expiresAt / daysLeft / packageCode，
+            soonest_expiring_days 无需改码即可生效。
+            """
+            if not isinstance(src, dict):
+                return {}
+            out = {}
+            for key in ("expiresAt", "expireAt", "expires_at"):
+                if src.get(key) is not None:
+                    out["expires_at"] = normalize_epoch(src[key])
+                    break
+            for key in ("daysLeft", "days_left"):
+                if src.get(key) is not None:
+                    out["days_left"] = src[key]
+                    break
+            if src.get("noExpiry") is not None:
+                out["no_expiry"] = bool(src.get("noExpiry"))
+            code = src.get("packageCode") or src.get("package_code")
+            if code:
+                out["package_code"] = str(code)
+            return out
+
         remain = int(_num(uq, "remaining") + _num(aq, "remaining"))
         used = int(_num(uq, "used") + _num(aq, "used"))
         size = int(_num(uq, "total") + _num(aq, "total"))
@@ -1883,13 +2390,17 @@ class Account(object):
             "expires_at": normalize_epoch(q.get("expiresAt")),
             "packages": [
                 {"name": "基础额度", "remain": int(_num(uq, "remaining")),
-                 "used": int(_num(uq, "used")), "size": int(_num(uq, "total"))},
+                 "used": int(_num(uq, "used")), "size": int(_num(uq, "total")),
+                 **_expiry_of(uq)},
                 {"name": "赠送/签到额度", "remain": int(_num(aq, "remaining")),
-                 "used": int(_num(aq, "used")), "size": int(_num(aq, "total"))},
+                 "used": int(_num(aq, "used")), "size": int(_num(aq, "total")),
+                 **_expiry_of(aq)},
             ],
             "updated_at": time.time(),
             "updated_iso": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
+        # task-61：余额刷新是 402 停放的**唯一**解封路径（remain > 0 才解）。
+        self.revive_balance_cooldown()
         if self.path and os.path.exists(os.path.dirname(self.path)):
             self.save(os.path.dirname(self.path))
         return {"ok": True, "credits": self.credits}
@@ -2041,6 +2552,131 @@ def add_to_pool(account):
     return _ACTIVE_POOL.add(account)
 
 
+class CreditsRefresher(object):
+    """后台余额刷新 + 当日用量折叠（task-61 / §2.5，G1 的自动恢复路径）。
+
+    · 每个 tick **最多**刷新一个账号（最陈旧且已过 TTL）—— 上游计费调用有界：
+      默认 30min tick + 12h TTL -> 每账号每天约 2 次，与池大小无关。
+    · 同一 tick 顺带折叠本地 usage（不联网），把当日 token/credit 推给守卫。
+    · 刷新失败的账号停放 6h（§2.5），避免对着坏凭证连打。
+    · **惰性启动**：只有某个账号的护栏阈值 > 0 时（apply_quota_limits 内）才
+      start；阈值全 0 时线程根本不存在，测试 / CLI 场景零副作用。
+    """
+
+    def __init__(self, pool, interval_seconds=None,
+                 ttl_seconds=None, log=None):
+        self.pool = pool
+        self.interval_seconds = max(60, int(interval_seconds
+                                        or _QUOTA_REFRESHER_INTERVAL))
+        hours = DEFAULT_CREDITS_REFRESH_HOURS if ttl_seconds is None \
+            else float(ttl_seconds) / 3600.0
+        self.ttl_seconds = max(0.0, float(hours) * 3600.0)
+        self._log = log or (lambda *a, **k: None)
+        self._parked = {}
+        self._stop = threading.Event()
+        self._wake = threading.Event()
+        self._thread = None
+
+    # -- 生命周期 ---------------------------------------------------------
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            return False
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run,
+                                        name="credits-refresher", daemon=True)
+        self._thread.start()
+        return True
+
+    def stop(self, timeout=2.0):
+        self._stop.set()
+        self._wake.set()
+        th = self._thread
+        if th and th.is_alive():
+            th.join(timeout=timeout)
+        self._thread = None
+
+    def wake(self):
+        self._wake.set()
+
+    def running(self):
+        return bool(self._thread and self._thread.is_alive())
+
+    # -- 单次动作 ---------------------------------------------------------
+    def stalest_account(self, now=None):
+        """最陈旧且已过 TTL 的可用账号；都没过期 -> None（不产生上游调用）。"""
+        now = now if now is not None else time.time()
+        best, best_age = None, None
+        for a in (self.pool.accounts if self.pool else []):
+            if not a.enabled or not a.access_token:
+                continue
+            if self._parked.get(a.uid, 0.0) > now:
+                continue
+            cred = a.credits if isinstance(a.credits, dict) else {}
+            updated = cred.get("updated_at")
+            try:
+                age = now - float(updated)
+            except (TypeError, ValueError):
+                age = float("inf")      # 从未取过余额 -> 最陈旧（优先填充）
+            if age < self.ttl_seconds:
+                continue
+            if best_age is None or age > best_age:
+                best, best_age = a, age
+        return best
+
+    def refresh_once(self, now=None):
+        """刷新一个账号的余额；无可刷账号返回 None（零上游调用）。"""
+        if self.ttl_seconds <= 0:
+            return None                 # TTL=0 -> 关闭（§5.5 E1）
+        acct = self.stalest_account(now=now)
+        if acct is None:
+            return None
+        try:
+            res = acct.fetch_credits()
+        except Exception as exc:
+            res = {"ok": False, "error": str(exc)}
+        if isinstance(res, dict) and res.get("ok"):
+            self._parked.pop(acct.uid, None)
+            self._log_msg("quota refresher: %s refreshed (remain=%s)"
+                          % (acct.uid[:8], (acct.credits or {}).get("remain")))
+        else:
+            self._parked[acct.uid] = (now if now is not None else time.time()) \
+                + _QUOTA_REFRESHER_PARK
+            self._log_msg("quota refresher: %s failed -> parked 6h (%s)"
+                          % (acct.uid[:8], (res or {}).get("error")),
+                          level="WARN")
+        return res
+
+    def _log_msg(self, msg, level=None):
+        """容错日志：AccountPool.log 默认是 `lambda msg: None`（只吃一个位置参数），
+
+        直接传 level= 会 TypeError —— 那会在 daemon 线程里静默炸掉整条刷新链路
+        （实测踩过：线程 Exception 后 running() 变 False）。
+        """
+        try:
+            self._log(msg, level=level)
+            return
+        except TypeError:
+            pass
+        except Exception:
+            return
+        try:
+            self._log(msg)
+        except Exception:
+            pass
+
+    def _run(self):
+        while not self._stop.is_set():
+            try:
+                self.refresh_once()
+                if self.pool is not None:
+                    self.pool.refresh_daily_usage()
+            except Exception as exc:
+                self._log_msg("quota refresher tick failed: %s" % exc,
+                              level="WARN")
+            self._wake.wait(self.interval_seconds)
+            self._wake.clear()
+
+
 class AccountPool(object):
     def __init__(self, directory, log=None):
         global _ACTIVE_POOL
@@ -2051,6 +2687,10 @@ class AccountPool(object):
         self._lock = threading.RLock()
         self._cursor = 0
         self.affinity = SessionAffinity()
+        # task-61：后台余额刷新（惰性启动，见 apply_quota_limits）
+        self.quota_refresher = None
+        # task-61 §2.6：临期加权轮询的运行期状态（uid -> 当前累计权重，重启即重置）
+        self._expiry_weights = {}
         _ACTIVE_POOL = self
 
     def load(self):
@@ -2116,6 +2756,144 @@ class AccountPool(object):
             self.accounts.remove(account)
             return True
 
+    # -- 限额护栏（task-61）------------------------------------------------
+    def apply_quota_limits(self, limits=None, usage=None, free_models=None):
+        """一次 apply 推送四条护栏的配置 + 计数 + free 名单（R3 必须同批）。
+
+        limits   : {"reserve_credits","daily_token_limit","daily_credit_limit",
+                    "model_daily_token_limit"}（缺省键保持原值；<=0 = 关闭）
+        usage    : fold_daily_usage() 的产物。**None 保留上次计数**——设置改动
+                   不会把已折叠的计数打回未知（D2）；传 dict 时，有账号但今日
+                   无记录的 uid 折叠为 **0 而不是 None**（D4）。
+        free_models : 与守卫同批推送的免费名单（R3：空集会拦住全部模型）。
+        返回状态翻转列表（was/now），调用方据此只打印翻转（D3）。
+        """
+        flips = []
+        with _QUOTA_LOCK:
+            accounts = list(self.accounts)
+            # D3：翻转比对覆盖四条护栏（含 reserve 与 free 名单改动），
+            # 快照必须取在应用之前 —— 只有状态真的变化才产生一条日志。
+            was_state = {a.uid: (a.reserve_blocked(), a.daily_limit_blocked(),
+                                 a.credit_limit_reached(),
+                                 bool(a.blocked_model_names()))
+                         for a in accounts}
+            if limits:
+                for key in ("reserve_credits", "daily_token_limit",
+                            "daily_credit_limit", "model_daily_token_limit",
+                            "expiring_window_days"):
+                    if key not in limits:
+                        continue
+                    try:
+                        val = max(0, int(limits.get(key) or 0))
+                    except (TypeError, ValueError):
+                        val = 0
+                    for a in accounts:
+                        setattr(a, key, val)
+            if free_models is not None:
+                names = frozenset(str(x) for x in (free_models or ()) if x)
+                for a in accounts:
+                    a.free_models = names
+            if usage is not None:
+                tokens = usage.get("tokens") or {}
+                credits = usage.get("credits") or {}
+                per_model = usage.get("model_tokens") or {}
+                for a in accounts:
+                    uid = a.uid
+                    a.daily_tokens_today = int(tokens.get(uid, 0) or 0)
+                    a.daily_credits_today = float(credits.get(uid, 0) or 0)
+                    a.model_daily_tokens = dict(per_model.get(uid) or {})
+            for a in accounts:
+                now = (a.reserve_blocked(), a.daily_limit_blocked(),
+                       a.credit_limit_reached(),
+                       bool(a.blocked_model_names()))
+                if was_state.get(a.uid) != now:
+                    flips.append({"uid": a.uid, "was": was_state.get(a.uid),
+                                  "now": now})
+            needs_refresher = any(
+                a.reserve_credits or a.daily_token_limit
+                or a.daily_credit_limit or a.model_daily_token_limit
+                for a in accounts)
+            credit_on = any(a.daily_credit_limit > 0 for a in accounts)
+            free_count = len(accounts[0].free_models) if accounts else 0
+        for f in flips:
+            self.log("quota guard flip: %s was=%s now=%s"
+                     % (f["uid"][:8], f["was"], f["now"]))
+        if credit_on and free_count == 0:
+            self.log("quota guard: daily_credit_limit 已启用但 free 名单为空 —— "
+                     "credit 守卫会拦住**全部**模型（R3，请与守卫同批推送 is_free）",
+                     level="WARN")
+        if needs_refresher:
+            self._ensure_quota_refresher()
+        return flips
+
+    def apply_settings(self, limits_data=None, free_models=None):
+        """把运行设置里的护栏阈值推给全池（启动时 + 每次设置保存后各一次）。
+
+        limits_data: qoder_settings.limits_data() 的三级作用域结构
+                     （{"reserve_credits": {"global":0,"intl":0,"cn":0}, ...}）；
+                     缺键/None 按 0 处理（= 关闭该护栏）。
+        free_models: is_free 名单，**与阈值同批推送**（R3：空集会拦住全部模型）；
+                     None = 保持池内现值（不覆盖）。
+
+        逐账号按自己的 realm 取值（realm override > global），再复用
+        apply_quota_limits 做翻转日志与「惰性启动后台刷新」。
+        """
+        keys = ("reserve_credits", "daily_token_limit", "daily_credit_limit",
+                "model_daily_token_limit", "expiring_window_days")
+        limits = limits_data if isinstance(limits_data, dict) else {}
+        flips = []
+        with _QUOTA_LOCK:
+            accounts = list(self.accounts)
+            # 快照取在设值之前：这样通过设置页改阈值也会产生翻转日志（D3）。
+            was_state = {a.uid: (a.reserve_blocked(), a.daily_limit_blocked(),
+                                 a.credit_limit_reached(),
+                                 bool(a.blocked_model_names()))
+                         for a in accounts}
+            for a in accounts:
+                for key in keys:
+                    setattr(a, key, _scope_limit_value(limits.get(key), a.realm))
+            for a in accounts:
+                now = (a.reserve_blocked(), a.daily_limit_blocked(),
+                       a.credit_limit_reached(),
+                       bool(a.blocked_model_names()))
+                if was_state.get(a.uid) != now:
+                    flips.append({"uid": a.uid, "was": was_state.get(a.uid),
+                                  "now": now})
+        for f in flips:
+            self.log("quota guard flip (settings): %s was=%s now=%s"
+                     % (f["uid"][:8], f["was"], f["now"]))
+        return self.apply_quota_limits(free_models=free_models)
+
+    def refresh_daily_usage(self, log_path=None):
+        """折叠本地 usage -> 各账号当日计数（只读文件，不联网）。
+
+        log_path 优先级（与 fold_daily_usage 同一套）：
+          显式参数 > qoder_accounts.USAGE_LOG_OVERRIDE > QD_PROXY_USAGE_DIR
+          > <包目录>/usage/usage.jsonl（与 qoder_proxy.USAGE_DIR 默认同源）。
+        生产链路（CreditsRefresher）不传参 —— 夹具注入请用
+        `QD_PROXY_USAGE_DIR=<dir>` 或 `qoder_accounts.USAGE_LOG_OVERRIDE=<file>`。
+        """
+        data = fold_daily_usage(log_path)
+        self.apply_quota_limits(usage=data)
+        return data
+
+    def quota_enabled(self):
+        """是否有账号开着至少一条护栏（决定 refresher 是否值得启动）。"""
+        return any(a.reserve_credits or a.daily_token_limit
+                   or a.daily_credit_limit or a.model_daily_token_limit
+                   for a in self.accounts)
+
+    def _ensure_quota_refresher(self):
+        """惰性启动后台刷新（G1 的唯一周期性恢复路径，不能省）。"""
+        if self.quota_refresher is None:
+            self.quota_refresher = CreditsRefresher(self, log=self.log)
+        if self.quota_enabled() and not self.quota_refresher.running():
+            self.quota_refresher.start()
+            self.log("quota refresher started (tick=%ds ttl=%.1fh)"
+                     % (self.quota_refresher.interval_seconds,
+                        self.quota_refresher.ttl_seconds / 3600.0))
+        return self.quota_refresher
+
     # -- 选择与健康 --------------------------------------------------------
     def count_ready(self, realm=None, model=None):
         with self._lock:
@@ -2137,7 +2915,67 @@ class AccountPool(object):
             self.affinity.bind(session_key, account.uid)
         return account
 
-    def pick(self, realm=None, exclude=None, model=None):
+    def _expiry_weight(self, account):
+        """临期权重 = max(1, int(round(window - soonest_days)) + 1)（wb:2420 同式）。
+
+        离过期越近权重越大（线性）；地板 1 防止窗口边缘的号被饿死。
+        window <= 0 或无法判断（soonest is None）-> 1，等同普通轮转。
+        """
+        window = account.expiring_window_days or 0
+        if window <= 0:
+            return 1
+        soonest = account.soonest_expiring_days()
+        if soonest is None:
+            return 1
+        try:
+            return max(1, int(round(float(window) - float(soonest))) + 1)
+        except (TypeError, ValueError):
+            return 1
+
+    def _weighted_pick(self, candidates):
+        """nginx smooth weighted round-robin（wb:2422 同算法）。
+
+        每轮各账号累加权重、最大者胜、胜者回吐本轮总权重 —— 等权时退化为严格轮转。
+        状态在 self._lock 内读写；_expiry_weights 是运行期状态（重启重置）。
+        """
+        if not candidates:
+            return None
+        weights = [self._expiry_weight(a) for a in candidates]
+        total = sum(weights) or 1
+        with self._lock:
+            state = self._expiry_weights
+            best_i, best_cur = 0, None
+            for i, a in enumerate(candidates):
+                cur = state.get(a.uid, 0) + weights[i]
+                if best_cur is None or cur > best_cur:
+                    best_i, best_cur = i, cur
+            winner = candidates[best_i]
+            state[winner.uid] = best_cur - total
+            if len(state) > 256:        # 防无界增长：清掉不在本轮候选里的 uid
+                keep = {a.uid for a in candidates}
+                for uid in [u for u in state if u not in keep]:
+                    state.pop(uid, None)
+        return winner
+
+    def _pick_expiring_first(self, realm=None, exclude=None, model=None):
+        """窗口内（临期）的可用账号里做加权轮询；没有候选 -> None（由 pick 回落）。"""
+        exclude = exclude or set()
+        with self._lock:
+            snapshot = [a for a in self.accounts if not realm or a.realm == realm]
+        cands = [a for a in snapshot
+                 if a.uid not in exclude and a.ready(model=model)
+                 and a.in_expiring_window()]
+        if not cands:
+            return None
+        return self._weighted_pick(cands)
+
+    def _rotate_pick(self, realm=None, exclude=None, model=None):
+        """纯 round-robin + 两轮降权扫描（task-74 三族之三）。
+
+        第一轮先跳过降权窗口内的账号（degraded()），第二轮不跳过——降权号仍然
+        可用（不是封禁），只是没有更健康候选时才回落使用（不楔死）。无降权号
+        的池行为与原实现逐字节一致。
+        """
         exclude = exclude or set()
         with self._lock:
             snapshot = [a for a in self.accounts if not realm or a.realm == realm]
@@ -2145,16 +2983,32 @@ class AccountPool(object):
         total = len(snapshot)
         if total == 0:
             return None
-        for offset in range(total):
-            index = (start + offset) % total
-            account = snapshot[index]
-            if account.uid in exclude:
-                continue
-            if account.ready(model=model):
-                with self._lock:
-                    self._cursor = (index + 1) % total
-                return account
+        now = time.time()
+        for skip_degraded in (True, False):
+            for offset in range(total):
+                index = (start + offset) % total
+                account = snapshot[index]
+                if account.uid in exclude:
+                    continue
+                if skip_degraded and account.degraded(now):
+                    continue
+                if account.ready(model=model):
+                    with self._lock:
+                        self._cursor = (index + 1) % total
+                    return account
         return None
+
+    def pick(self, realm=None, exclude=None, model=None):
+        """选号：临期积分优先（平滑加权），否则回落普通轮转。
+
+        `expiring_window_days` 默认 0（R7）-> in_expiring_window() 恒 False ->
+        _pick_expiring_first 返回 None -> 与旧的纯 round-robin **完全一致**。
+        """
+        account = self._pick_expiring_first(realm=realm, exclude=exclude,
+                                            model=model)
+        if account is not None:
+            return account
+        return self._rotate_pick(realm=realm, exclude=exclude, model=model)
 
     def representative(self, realm=None):
         with self._lock:
@@ -2317,6 +3171,9 @@ class AccountPool(object):
         })
         url = cfg["openapi"] + PATH_DEVICE_POLL + "?" + q
         validate_public_http_url(url)
+        # task-80 判定：本调用**不带账号凭证**（device flow 的 nonce/verifier
+        # challenge，无 Authorization），且依赖原始 HTTPError 语义
+        # （404/202 = 尚未授权 -> pending）——**故意保留直连**，不收口。
         req = urllib.request.Request(url, method="GET", headers={
             "Accept": "application/json",
             "User-Agent": "QoderWork",
@@ -2352,14 +3209,16 @@ class AccountPool(object):
         # 拉取 userinfo 补全昵称/用户类型（尽力而为，不阻塞入库）
         try:
             ui_url = cfg["openapi"] + PATH_USERINFO
-            validate_public_http_url(ui_url)
-            req_ui = urllib.request.Request(ui_url, method="GET", headers={
+            # task-80 收口（P1-2 第一步）：本调用**携带账号凭证**
+            # （Authorization: Bearer <token>），必须走统一出站函数 http_json
+            # ——它是「所有带凭证调用都过同一出口」的唯一保证点（未来若上
+            # 出站代理/审计，自动覆盖）。语义保持：retries=1（原实现单次）、
+            # URL 校验由 http_json 内部执行、失败仍由外层 except 兜底。
+            ui = http_json(ui_url, method="GET", headers={
                 "Accept": "application/json",
                 "User-Agent": CLIENT_UA,
                 "Authorization": "Bearer " + token,
-            })
-            with urllib.request.urlopen(req_ui, timeout=15) as resp_ui:
-                ui = json.loads(resp_ui.read().decode("utf-8"))
+            }, timeout=15, retries=1)
             uid = str(ui.get("id") or uid)
             nickname = str(ui.get("name") or "")
             user_type = str(ui.get("user_type") or "") or DEFAULT_USER_TYPE

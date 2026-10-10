@@ -15,6 +15,12 @@ import unittest
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+# test_scheduler installs a minimal qoder_proxy stub so it can exercise the
+# scheduler without importing the server. unittest discovery keeps that stub
+# in sys.modules for later files; this HTTP integration suite needs the real
+# handler, regardless of test ordering.
+if not hasattr(sys.modules.get('qoder_proxy'), 'open_upstream'):
+    sys.modules.pop('qoder_proxy', None)
 import qoder_proxy as proxy
 
 

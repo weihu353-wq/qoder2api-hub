@@ -365,6 +365,13 @@ a:hover{text-decoration:underline}
       </div>
     </div>
     <div id="recent" class="table-wrap"></div>
+    <div class="legend" style="margin-top:10px">
+      <span><b>档位</b>＝客户端请求 → 实际下发：<span class="badge ok" style="font-size:10px">同值</span> 原样透传 ·
+        <span class="badge warn" style="font-size:10px">A → B</span> 归一化时被挪档 ·
+        <span class="badge bad" style="font-size:10px">→ 未下发</span> 请求了但被丢弃（模型无档位表）；
+        <span style="color:var(--dim)">—</span> 表示该行没有档位字段（旧行 / 客户端未请求）</span>
+      <span><b>Key</b>＝仅显示标识（面板备注名 / 内置来源），不涉明文；<span style="color:var(--dim)">无 Key / 面板会话</span> 表示该行不带 Key（聚合时归入 (no-key) 桶）</span>
+    </div>
     <div id="recentPagination" style="display:flex;align-items:center;justify-content:space-between;margin-top:14px;padding-top:12px;border-top:1px solid var(--line);font-size:12px;color:var(--dim);flex-wrap:wrap;gap:8px">
       <div id="recentPageInfo">第 1 / 1 页 · 共 0 条记录</div>
       <div style="display:inline-flex;gap:5px;align-items:center">
@@ -539,6 +546,24 @@ a:hover{text-decoration:underline}
       <span><i style="background:var(--accent)"></i>总 Token 占比进度条</span>
     </div>
   </section>
+
+    <!-- 表格 3：按 API Key 的用量透视（P1-3 审计：Key 归属） -->
+    <section>
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:10px">
+        <h2 style="margin:0">按 API Key 用量透视 <em id="keyMatrixCount"></em></h2>
+        <div style="font-size:12px;color:var(--dim)" id="keyMatrixRange">时间窗口：—</div>
+      </div>
+      <div id="keyMatrix" style="overflow-x:auto"></div>
+      <div style="margin-top:16px">
+        <div style="font-size:13px;font-weight:600;color:var(--fg);margin-bottom:6px">各 Key 的档位分布（P1-3 审计 · 基于最近请求样本）</div>
+        <div id="effortByKey"></div>
+      </div>
+      <div class="legend" style="margin-top:10px">
+        <span><b>历史行未记录 Key</b>：P1-3 字段上线前的行（或未带 Key 的面板会话/未鉴权请求）日志里没有 key_id，
+          后端把它们合并成一个桶，<b>不会丢弃</b></span>
+        <span>数据源与账号维度同源、同窗口：同一 range 下 <b>Σ(按 Key) == Σ(按账号)</b></span>
+      </div>
+    </section>
   </div>
 
 
@@ -577,6 +602,30 @@ a:hover{text-decoration:underline}
         <button onclick="addApiKeyRow()">+ 添加 API Key</button>
       </div>
       <div id="keyList"></div>
+    </section>
+
+    <section id="sectionLimits">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;flex-wrap:wrap;gap:10px">
+        <div>
+          <h2 style="margin:0">事实性限额护栏 <em id="setLimitsState"></em></h2>
+          <div style="font-size:12px;color:var(--dim);margin-top:4px;line-height:1.6">
+            三个作用域：<b>全局默认</b>对所有账号生效；<b>国际版 / 国内版</b> <b>留空 = 继承全局</b>，填 <b>0 = 关闭</b>该区域的这条护栏（0 不是「限制为 0」）。
+            阈值 ≤ 0 的护栏完全不生效；计数未知时按放行处理（fail-open），账号行会如实标成「未知」。
+          </div>
+        </div>
+        <button id="btnSaveLimits" onclick="saveLimits(this)">保存限额</button>
+      </div>
+      <div class="table-wrap"><table>
+        <thead>
+          <tr>
+            <th style="text-align:left;min-width:300px">护栏</th>
+            <th style="width:150px">全局默认</th>
+            <th style="width:180px">国际版</th>
+            <th style="width:180px">国内版</th>
+          </tr>
+        </thead>
+        <tbody id="limitsTbody"></tbody>
+      </table></div>
     </section>
 
     <section>
@@ -1790,6 +1839,45 @@ function toast(msg, kind){
 /* ------------------------------- accounts ------------------------------- */
 let USAGE_BY_ACCOUNT = {};
 
+// 账号行护栏状态四态（.team/_gap/03-candidate-deep-dive.md §3.4 / R2）：
+//   未启用 = 所有阈值 ≤ 0；未知 = 阈值 > 0 但计数为 null（fail-open 放行中）；
+//   已暂停 = 守卫命中；正常 = 阈值 > 0、计数已知、未命中。
+// 四态必须能区分，否则运维会把「开了但计数未知」误当成「开了没用」。
+function accountGuardBadge(a){
+  const cred = (a.credits && typeof a.credits === 'object') ? a.credits : null;
+  const parts = [], extras = [];
+  const num = v => (v === null || v === undefined) ? '未知' : fmt(v);
+  const add = (label, threshold, blocked, unknown, detail) => {
+    if(!(Number(threshold) > 0)) return;
+    const state = blocked ? 'blocked' : (unknown ? 'unknown' : 'ok');
+    parts.push({ state: state,
+      text: label + (state === 'blocked' ? '：已暂停' : (state === 'unknown' ? '：计数未知（放行中）' : '：放行'))
+            + (detail ? '（' + detail + '）' : '') });
+  };
+  add('保留积分', a.reserveCredits, a.reserveBlocked,
+      !cred || cred.remain === null || cred.remain === undefined,
+      '阈值 ' + num(a.reserveCredits) + '，余额 ' + (cred ? num(cred.remain) : '未知'));
+  add('每日 Token', a.dailyTokenLimit, a.dailyLimitBlocked,
+      a.dailyTokensToday === null || a.dailyTokensToday === undefined,
+      '阈值 ' + num(a.dailyTokenLimit) + '，今日 ' + num(a.dailyTokensToday));
+  add('每日积分', a.dailyCreditLimit, a.creditLimitReached,
+      a.dailyCreditsToday === null || a.dailyCreditsToday === undefined,
+      '阈值 ' + num(a.dailyCreditLimit) + '，今日 ' + num(a.dailyCreditsToday));
+  const blockedModels = Array.isArray(a.modelTokenBlocked) ? a.modelTokenBlocked : [];
+  if(blockedModels.length){
+    parts.push({ state: 'blocked',
+      text: '单模型 Token：已暂停（' + blockedModels.length + ' 个模型受限：' + blockedModels.slice(0, 3).join('、') + '）' });
+  }
+  if(Number(a.expiringWindowDays) > 0){
+    extras.push('临期优先窗口 ' + a.expiringWindowDays + ' 天' + (a.inExpiringWindow ? '（本号在窗口内，优先派发）' : ''));
+  }
+  const title = esc(parts.map(p => p.text).concat(extras).join('；') || '所有护栏阈值均为 0：未启用');
+  if(!parts.length) return '<span class="badge off" title="' + title + '">未启用</span>';
+  if(parts.some(p => p.state === 'blocked')) return '<span class="badge bad" title="' + title + '">已暂停</span>';
+  if(parts.some(p => p.state === 'unknown')) return '<span class="badge warn" title="' + title + '">未知</span>';
+  return '<span class="badge ok" title="' + title + '">正常</span>';
+}
+
 function accountRow(a){
   const realmBadge = a.realm === 'cn'
     ? '<span class="realm-badge-cn">国内版</span>'
@@ -1815,6 +1903,7 @@ function accountRow(a){
     + (a.machineId ? ('<div class="mono" style="color:var(--dim);font-size:10px;margin-top:2px" title="由账号UID稳定派生的专属设备码，防多号关联风控">设备码: ' + esc(a.machineId.slice(0,14)) + '...</div>') : '')
     + err + '</td>'
     + '<td style="text-align:center">' + state + '</td>'
+    + '<td style="text-align:center;white-space:nowrap">' + accountGuardBadge(a) + '</td>'
     + '<td style="text-align:left;white-space:nowrap">' + credText + '</td>'
     + '<td style="text-align:right">' + fmt(usage.requests) + '</td>'
     + '<td style="text-align:right">' + fmt(usage.total_tokens) + '</td>'
@@ -1860,6 +1949,7 @@ function renderAccounts(){
     + '<th style="text-align:center;width:76px">版本</th>'
     + '<th style="text-align:left">账号</th>'
     + '<th style="text-align:center;width:84px">状态</th>'
+    + '<th style="text-align:center;width:96px">护栏</th>'
     + '<th style="text-align:left;width:120px">积分</th>'
     + '<th style="text-align:right;width:70px">请求</th>'
     + '<th style="text-align:right;width:88px">总 token</th>'
@@ -2346,6 +2436,58 @@ async function refresh(){
   try { await refreshInner(); }
   finally { REFRESH_BUSY = false; }
 }
+/* ---- P1-3 审计列：用量行的 key 归属与推理档位（字段来自 record_usage 的可选三键）----
+   · key_id：只显示**标识**（面板备注名 / legacy / launcher），绝不含明文；缺失 = 面板会话或未开鉴权。
+   · reasoning_effort_requested（客户端请求）与 reasoning_effort（实际下发）成对展示，三态一眼可辨：
+       A) 两者同值   → 原样透传（绿）
+       B) 两者不同   → 归一化时被挪档（黄）
+       C) 实际为空串 → 请求了但被丢弃/未下发（红；这是「没生效」在面板上唯一的出口）
+     注意：**键缺失**（客户端没请求该参数）与**空串**（请求了但没生效）是两件事，不能合并显示。 */
+// key_id 三种来源（口径与后端 usage_by_key 的 "(no-key)" 桶一致）：
+//   12 位 hex = 面板分配的 Key；legacy = 面板默认（跟随面板切换）；launcher = 启动参数下发的 Key。
+const KEY_ID_LABELS = { legacy: '默认（面板切换）', launcher: '启动参数' };
+const KEY_NO_KEY_ID = '(no-key)';   // 后端 usage_by_key 的历史/无 Key 桶名（原样识别，不展示给用户）
+// 统一的 Key 展示口径（最近请求表的 Key 列与「按 Key 用量透视」共用，绝不显示明文）。
+// 返回 {label, sub, cls, title}；cls 为空 = 用文字样式渲染，非 badge。
+function keyDisplay(id){
+  const raw = (typeof id === 'string') ? id : '';
+  if(!raw || raw === KEY_NO_KEY_ID){
+    return { label: '历史行未记录 Key', sub: '', cls: 'badge off',
+             title: '这批行没有 key_id：P1-3 字段上线前的历史行，或未带 Key 的面板会话 / 未鉴权请求；后端把它们合并成一个「无 Key」桶，不会被丢弃' };
+  }
+  if(KEY_ID_LABELS[raw]){
+    return { label: KEY_ID_LABELS[raw], sub: esc(raw), cls: 'badge off',
+             title: '来源标识 ' + esc(raw) + '（伪 Key，非面板分配的 12 位 id）' };
+  }
+  const rows = (typeof API_KEY_ROWS !== 'undefined' && API_KEY_ROWS.length) ? API_KEY_ROWS : (window.API_KEY_ROWS || []);
+  const hit = rows.find(k => (k.id || '') === raw);
+  const short = raw.slice(0, 4) + '…' + raw.slice(-4);
+  if(!hit){
+    return { label: '已删除的 Key', sub: esc(short), cls: 'badge warn',
+             title: 'Key 标识 ' + esc(raw) + ' 不在当前配置里（已删除，或来自另一台实例）' };
+  }
+  return { label: esc(hit.name || '未命名'), sub: esc(short), cls: '', title: 'Key 标识 ' + esc(raw) };
+}
+function keyCell(r){
+  const d = keyDisplay(r.key_id);
+  if(d.cls) return '<span class="' + d.cls + '" title="' + d.title + '">' + d.label + (d.sub ? ' ' + d.sub : '') + '</span>';
+  return d.label + '<div class="mono" style="color:var(--dim);font-size:10px">' + d.sub + '</div>';
+}
+function effortCell(r){
+  const mono = s => '<span class="mono" style="font-size:11px">' + esc(s) + '</span>';
+  const hasReq = Object.prototype.hasOwnProperty.call(r, 'reasoning_effort_requested');
+  const hasEff = Object.prototype.hasOwnProperty.call(r, 'reasoning_effort');
+  const req = hasReq ? String(r.reasoning_effort_requested || '') : '';
+  const eff = hasEff ? String(r.reasoning_effort || '') : '';
+  if(!hasReq && !hasEff) return '<span style="color:var(--dim)" title="这一行没有档位字段（旧行，或客户端未请求该参数）">—</span>';
+  if(hasEff && eff === ''){
+    return '<span class="badge bad" title="客户端请求 ' + esc(req || '?') + '，归一化后未下发给上游（模型无档位表或被丢弃）">' + mono(req || '?') + ' → 未下发</span>';
+  }
+  if(!hasReq) return mono(eff) + ' <span style="color:var(--dim);font-size:10px">服务端默认</span>';
+  if(eff === req) return '<span class="badge ok" title="请求 ' + esc(req) + '，实际下发 ' + esc(eff) + '：原样透传">' + mono(req) + '</span>';
+  return '<span class="badge warn" title="请求 ' + esc(req) + '，实际下发 ' + esc(eff) + '：归一化时被挪档">' + mono(req) + ' → ' + mono(eff) + '</span>';
+}
+
 async function refreshInner(){
   let usage, recent, perf;
   try{
@@ -2531,14 +2673,17 @@ async function refreshInner(){
   }
 
   const rows = recent.rows || [];
+  RECENT_SNAPSHOT = { page: RECENT_PAGE, limit: RECENT_LIMIT, total: total, rows: rows };   // 档位分布的样本（口径见 renderEffortByKey）
   const countEl = document.getElementById('recentCount');
   if(countEl) countEl.textContent = '(第 ' + RECENT_PAGE + ' 页 / 共 ' + fmt(total) + ' 条)';
   document.getElementById('recent').innerHTML = rows.length ?
-    '<table><thead><tr><th>时间</th><th>模型</th><th>账号</th><th>模式</th><th>耗时</th><th>首字</th><th>速度</th><th>输入</th><th>输出</th><th>思考</th><th>缓存</th><th>总 token</th></tr></thead><tbody>'
+    '<table><thead><tr><th>时间</th><th>模型</th><th>账号</th><th style="text-align:left">Key</th><th style="text-align:left">档位</th><th>模式</th><th>耗时</th><th>首字</th><th>速度</th><th>输入</th><th>输出</th><th>思考</th><th>缓存</th><th>总 token</th></tr></thead><tbody>'
     + rows.map(r => '<tr>'
         + '<td class="mono">' + esc((r.iso||'').replace('T',' ').slice(5)) + '</td>'
         + '<td class="mono">' + esc(r.model) + '</td>'
         + '<td class="mono" style="font-size:11px;color:var(--dim)">' + esc((r.account||'—').slice(0,8)) + '</td>'
+        + '<td style="text-align:left">' + keyCell(r) + '</td>'
+        + '<td style="text-align:left;white-space:nowrap">' + effortCell(r) + '</td>'
         + '<td><span class="badge ' + (r.stream?'s':'') + '">' + (r.stream?'流式':'非流式') + '</span></td>'
         + '<td>' + (r.error ? '<span class="badge bad">失败</span>' : (r.elapsed_ms!=null ? fmt(r.elapsed_ms)+' ms' : '—')) + '</td>'
         + '<td>' + (r.ttft_ms!=null ? fmt(r.ttft_ms)+' ms' : '—') + '</td>'
@@ -2550,6 +2695,7 @@ async function refreshInner(){
         + '<td><b>' + fmt(r.total_tokens) + '</b></td>'
       + '</tr>').join('') + '</tbody></table>'
     : '<div class="empty">还没有请求记录</div>';
+  renderEffortByKey();   // 样本变了就重算档位分布
 }
 
 (async function initDashboard(){
@@ -2763,6 +2909,7 @@ async function loadSettings(showToast){
     set('setUsageDir', data.usage_dir);
     set('setFile', data.settings_file);
     set('setSettingsFile', data.settings_file);
+    renderLimits(data.limits || null);   // 后端 GET /settings 带回 limits 时才允许保存（见 saveLimits 的护栏）
     if(showToast) toast('设置已刷新', 'ok');
   } catch(e) {
     if(showToast) toast('读取设置失败: ' + e.message, 'bad');
@@ -3057,6 +3204,125 @@ async function saveApiKeys(btn){
     toast('保存失败: ' + e.message, 'bad');
   } finally {
     if(btn) btn.disabled = false;
+  }
+}
+
+/* ---- 事实性限额护栏（5 键 × global / intl / cn，与后端 qoder_settings.LIMIT_KEYS 一一对应）----
+   语义：留空 = 继承 global；显式 0 = 关闭（0 不是「限制为 0」）；阈值 ≤ 0 的护栏完全不生效。
+   量纲：credits 类护栏的单位是**积分点数**（实测账号区间 0~1100），不是 token 量级。 */
+const LIMIT_FIELDS = [
+  { key: 'reserve_credits', label: '保留积分（余额地板）', unit: '积分点数', step: 10,
+    hint: '账号余额 ≤ 该值时暂停接单，避免余额用尽后触发上游短信提醒。单位是积分点数（实测账号区间 0~1100），不是 token —— 照 token 量级填会永远拦不到任何账号。' },
+  { key: 'daily_token_limit', label: '每日 Token 限额', unit: 'token', step: 1000000,
+    hint: '该账号当日累计 token 达到该值后暂停接单，请求自动切到其他账号；本地时间 0 点后恢复。单位是 token。' },
+  { key: 'daily_credit_limit', label: '每日积分限额', unit: '积分点数', step: 50,
+    hint: '该账号当日累计消耗积分达到该值后暂停接单（免费模型不计入）。单位是积分点数，不是 token。' },
+  { key: 'model_daily_token_limit', label: '单模型每日 Token 限额', unit: 'token', step: 1000000,
+    hint: '同一账号对同一个模型的当日 token 用量达到该值后，只暂停该模型的接单，其余模型照常。单位是 token。' },
+  { key: 'expiring_window_days', label: '临期优先窗口', unit: '天', step: 1,
+    hint: '余额将在该天数内到期的账号优先派发（0 = 关闭该偏好）。这是调度偏好，不是拦截护栏。' },
+];
+const LIMIT_SCOPES = [
+  { scope: 'global', prefix: '全局默认' },
+  { scope: 'intl', prefix: '国际版' },
+  { scope: 'cn', prefix: '国内版' },
+];
+const limitElId = (scope, key) => 'lim-' + scope + '-' + key;
+let LIMITS_LOADED = false;   // GET /settings 是否已带回 limits：没读到就不允许保存，避免把已有阈值覆盖成 0
+
+function limitNote(scope, unit, globalValue, raw){
+  if(scope === 'global') return globalValue > 0 ? ('全局阈值 ' + globalValue + ' ' + unit) : '0 = 关闭这条护栏';
+  if(raw === null || raw === undefined) {
+    return globalValue > 0
+      ? ('继承全局 ' + globalValue + ' ' + unit)
+      : '继承全局（global 为 0 → 本区域关闭）';
+  }
+  return Number(raw) === 0 ? '关闭（本区域不启用）' : ('本区域独立限额 ' + raw + ' ' + unit);
+}
+
+function renderLimits(limits){
+  const tbody = document.getElementById('limitsTbody');
+  if(!tbody) return;
+  LIMITS_LOADED = !!limits;
+  const anyOverride = limits ? LIMIT_FIELDS.some(f => {
+    const e = limits[f.key] || {};
+    return (e.intl !== null && e.intl !== undefined) || (e.cn !== null && e.cn !== undefined);
+  }) : false;
+  const stateEl = document.getElementById('setLimitsState');
+  if(stateEl){
+    stateEl.textContent = limits ? (anyOverride ? '(含区域覆盖)' : '(仅全局)') : '(未读到现有配置)';
+    stateEl.style.color = limits ? 'var(--accent2)' : 'var(--warn)';
+  }
+  const saveBtn = document.getElementById('btnSaveLimits');
+  if(saveBtn){
+    saveBtn.disabled = !limits;
+    saveBtn.title = limits ? '' : '未从后端读到现有 limits，保存会把已有阈值覆盖成 0，已暂时禁用';
+  }
+  tbody.innerHTML = LIMIT_FIELDS.map(f => {
+    const e = (limits && limits[f.key]) || {};
+    const globalValue = Number(e.global || 0);
+    const cells = LIMIT_SCOPES.map(s => {
+      const raw = s.scope === 'global' ? globalValue : e[s.scope];
+      const inherited = s.scope !== 'global' && (raw === null || raw === undefined);
+      const input = '<input id="' + limitElId(s.scope, f.key) + '" class="limit-input" type="number" min="0" step="' + f.step + '"'
+        + (inherited ? ' placeholder="继承全局 ' + globalValue + '"' : ' value="' + Number(raw) + '"')
+        + ' oninput="syncLimitNotes()"'
+        + ' style="width:100%;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:7px 10px;font:inherit;color:var(--fg)">';
+      return '<td style="text-align:left">'
+        + input
+        + '<div data-note-for="' + limitElId(s.scope, f.key) + '" style="font-size:11px;color:var(--dim);margin-top:3px;line-height:1.4">'
+        + limitNote(s.scope, f.unit, globalValue, raw) + '</div>'
+        + '</td>';
+    }).join('');
+    return '<tr>'
+      + '<td style="text-align:left">'
+      +   '<div style="font-weight:600;color:var(--fg);font-size:13px">' + f.label + '</div>'
+      +   '<div style="font-size:11px;color:var(--dim);margin-top:2px;line-height:1.5">' + f.hint + '</div>'
+      + '</td>' + cells + '</tr>';
+  }).join('');
+  syncLimitNotes();
+}
+
+// 输入变化时实时刷新说明：改了 global 就立刻反映到「继承全局 N」上，别让用户对着一句旧说明取舍
+function syncLimitNotes(){
+  LIMIT_FIELDS.forEach(f => {
+    const gEl = document.getElementById(limitElId('global', f.key));
+    const globalValue = (gEl && gEl.value !== '') ? Math.max(0, parseInt(gEl.value, 10) || 0) : 0;
+    ['intl', 'cn'].forEach(scope => {
+      const el = document.getElementById(limitElId(scope, f.key));
+      const note = document.querySelector('[data-note-for="' + limitElId(scope, f.key) + '"]');
+      if(!el || !note) return;
+      const blank = (el.value === '');
+      if(blank) el.placeholder = '继承全局 ' + globalValue;
+      note.textContent = limitNote(scope, f.unit, globalValue, blank ? null : el.value);
+    });
+  });
+}
+
+async function saveLimits(btn){
+  if(!LIMITS_LOADED){
+    toast('未从后端读到现有 limits：为避免把已有阈值覆盖成 0，保存已禁用', 'warn');
+    return;
+  }
+  if(btn){ btn.disabled = true; btn.textContent = '保存中...'; }
+  try{
+    const payload = {};
+    LIMIT_FIELDS.forEach(f => {
+      const scopes = {};
+      LIMIT_SCOPES.forEach(s => {
+        const el = document.getElementById(limitElId(s.scope, f.key));
+        // 空串交给后端语义：global 空 → 0（关）；intl/cn 空 → None（继承）
+        scopes[s.scope] = el ? String(el.value).trim() : '';
+      });
+      payload[f.key] = scopes;
+    });
+    const r = await postJSON('/settings/save', {limits: payload});
+    if(r && r.limits){ renderLimits(r.limits); toast('限额已保存', 'ok'); }
+    else { toast('限额已保存，但后端未回传归一化结果，正在重新读取…', 'warn'); loadSettings(); }
+  }catch(e){
+    toast('保存限额失败: ' + e.message, 'bad');
+  }finally{
+    if(btn){ btn.disabled = false; btn.textContent = '保存限额'; }
   }
 }
 
@@ -3421,11 +3687,146 @@ function setAnalyticsRange(range){
   } else {
     loadAnalytics();
   }
+  loadByKey();   // 窗口变了：矩阵必须按新 range 重新取（后端按窗口聚合，前端不做客户端过滤）
+}
+
+// 面板开关 → 服务端 range：day = 本地零点起（qoder_proxy.range_window 的语义），all = 无窗口。
+const BYKEY_RANGE = r => (r === 'today' ? 'day' : 'all');
+let cachedByKey = null;
+// 最近请求表当前页的原始行（档位分布的样本来源）。**非全量**——与 by-key 聚合是两个口径。
+let RECENT_SNAPSHOT = null;
+
+// 按 API Key 聚合窗口数据。**不做客户端聚合**：打 /usage/by-key（与 /usage/by-account
+// 同源同窗口同缓存），因此同一 range 下两边合计必然相等。
+async function loadByKey(){
+  const box = document.getElementById('keyMatrix');
+  try {
+    const data = await getJSON('/usage/by-key?range=' + encodeURIComponent(BYKEY_RANGE(analyticsRange)));
+    cachedByKey = data;
+    renderByKey(data);
+    renderEffortByKey();   // 档位分布跟着最近请求样本走（两处数据源独立，各自刷新）
+  } catch(err) {
+    if(box) box.innerHTML = '<div class="empty">按 Key 用量读取失败：' + esc(err.message) + '</div>';
+    console.error('loadByKey failed:', err);
+  }
+}
+
+// 按 API Key 的用量透视。key_id 缺失的行由后端归入 "(no-key)" 桶——这里如实显示
+// 「历史行未记录 Key」，不伪装成某个真实 Key（P1-3 之前的行都落在这个桶里）。
+function renderByKey(data){
+  const box = document.getElementById('keyMatrix');
+  if(!box) return;
+  const keys = (data && data.keys) || [];
+  const countEm = document.getElementById('keyMatrixCount');
+  if(countEm) countEm.textContent = keys.length ? ('(共 ' + keys.length + ' 个 Key)') : '';
+  const rangeEl = document.getElementById('keyMatrixRange');
+  if(rangeEl){
+    rangeEl.textContent = (analyticsRange === 'today' ? '时间窗口：今日（本地零点起）' : '时间窗口：全部历史')
+      + ' · 按总 Token 降序 · 与账号维度同源同窗口';
+  }
+  if(!keys.length){
+    box.innerHTML = '<div class="empty">当前窗口没有按 Key 的用量数据</div>';
+    return;
+  }
+  const maxTok = Math.max(1, ...keys.map(k => Number(k.total_tokens) || 0));
+  box.innerHTML = '<table><thead><tr>'
+    + '<th style="text-align:left;min-width:190px">Key（仅标识）</th>'
+    + '<th>请求数</th><th>输入</th><th>输出 (思考)</th><th>缓存</th><th>总 Token</th><th>用量占比</th><th>积分</th>'
+    + '<th style="text-align:left">模型（前 5）</th>'
+    + '</tr></thead><tbody>'
+    + keys.map(k => {
+        const d = keyDisplay(k.key_id);
+        const pctTok = Math.round((Number(k.total_tokens) || 0) / maxTok * 100);
+        const pills = (Array.isArray(k.models) ? k.models : []).map(m => {
+          const name = Array.isArray(m) ? m[0] : m;
+          const hits = Array.isArray(m) ? m[1] : '';
+          return '<span class="model-pill"><b style="color:var(--fg)">' + esc(name) + '</b>'
+            + (hits === '' ? '' : ': ' + fmt(hits) + ' 次') + '</span>';
+        }).join('') || '<span style="color:var(--dim)">—</span>';
+        const credit = (k.credit == null || Number(k.credit) === 0)
+          ? '<span style="color:var(--dim)">—</span>' : fmt(k.credit);
+        const orig = (k.original_credits != null && Number(k.original_credits) !== Number(k.credit))
+          ? ' <span style="color:var(--dim);font-size:11px">/ 原 ' + fmt(k.original_credits) + '</span>' : '';
+        return '<tr>'
+          + '<td style="text-align:left">'
+          +   (d.cls ? '<span class="' + d.cls + '" title="' + d.title + '">' + d.label + (d.sub ? ' ' + d.sub : '') + '</span>'
+                     : '<b style="color:var(--fg)">' + d.label + '</b><div class="mono" style="color:var(--dim);font-size:10px">' + d.sub + '</div>')
+          + '</td>'
+          + '<td>' + fmt(k.requests) + '</td>'
+          + '<td>' + fmt(k.prompt_tokens) + '</td>'
+          + '<td>' + fmt(k.completion_tokens)
+          +   (Number(k.reasoning_tokens) ? ' <span style="color:var(--think);font-size:11px">(' + fmt(k.reasoning_tokens) + ')</span>' : '') + '</td>'
+          + '<td>' + fmt(k.cached_tokens) + '</td>'
+          + '<td><b style="color:var(--accent)">' + fmt(k.total_tokens) + '</b></td>'
+          + '<td style="min-width:90px"><span class="bar-fill" style="width:' + Math.max(3, pctTok) + '%"></span>'
+          +   ' <span style="font-size:11px;color:var(--dim)">' + pctTok + '%</span></td>'
+          + '<td>' + credit + orig + '</td>'
+          + '<td style="text-align:left;max-width:420px">' + pills + '</td>'
+          + '</tr>';
+      }).join('')
+    + '</tbody></table>';
+}
+
+// 按 key 汇总档位分布：数据源是**最近请求表当前页的原始行**，不是 by-key 全量聚合，
+// 所以界面必须写明「基于最近 N 条」——否则数字与上方矩阵对不上会被误认为 bug。
+// 四类判定与 effortCell 完全同源：同值=原样透传 / 不同=被挪档 / 实际空串=被丢弃 / 键缺失=未请求。
+function effortStatsByKey(rows){
+  const buckets = {};
+  (rows || []).forEach(r => {
+    const id = (typeof r.key_id === 'string' && r.key_id) ? r.key_id : KEY_NO_KEY_ID;
+    const b = buckets[id] || (buckets[id] = { key_id: id, total: 0, same: 0, shifted: 0, dropped: 0, none: 0 });
+    b.total++;
+    const hasReq = Object.prototype.hasOwnProperty.call(r, 'reasoning_effort_requested');
+    const hasEff = Object.prototype.hasOwnProperty.call(r, 'reasoning_effort');
+    const req = hasReq ? String(r.reasoning_effort_requested || '') : '';
+    const eff = hasEff ? String(r.reasoning_effort || '') : '';
+    if(hasEff && eff === '') b.dropped++;
+    else if(!hasReq) b.none++;
+    else if(eff === req) b.same++;
+    else b.shifted++;
+  });
+  return Object.keys(buckets).map(k => buckets[k]).sort((a, b) => b.total - a.total);
+}
+
+function renderEffortByKey(){
+  const box = document.getElementById('effortByKey');
+  if(!box) return;
+  const snap = RECENT_SNAPSHOT;
+  if(!snap || !snap.rows || !snap.rows.length){
+    box.innerHTML = '<div class="hint" style="margin:0">等待最近请求数据（网关页的「最近请求」每 5 秒刷新一次）…</div>';
+    return;
+  }
+  const stats = effortStatsByKey(snap.rows);
+  const shifted = stats.reduce((n, s) => n + s.shifted, 0);
+  const dropped = stats.reduce((n, s) => n + s.dropped, 0);
+  const num = (n, cls) => n > 0 ? '<span class="badge ' + cls + '">' + n + '</span>' : '<span style="color:var(--dim)">0</span>';
+  box.innerHTML = '<div class="hint" style="margin:0 0 8px">口径：<b>基于最近请求表当前页（第 ' + snap.page + ' 页 · 样本 '
+      + snap.rows.length + ' 条 / 全量 ' + fmt(snap.total) + ' 条）</b>，<b>不是</b>上方按 Key 矩阵的全量聚合——两者口径不同，数字不可相减。</div>'
+    + '<div class="table-wrap"><table><thead><tr>'
+    + '<th style="text-align:left">Key（仅标识）</th><th>样本</th><th>原样透传</th><th>被挪档</th><th>被丢弃</th><th>未请求</th>'
+    + '</tr></thead><tbody>'
+    + stats.map(s => {
+        const d = keyDisplay(s.key_id);
+        return '<tr>'
+          + '<td style="text-align:left">'
+          +   (d.cls ? '<span class="' + d.cls + '" title="' + d.title + '">' + d.label + (d.sub ? ' ' + d.sub : '') + '</span>'
+                     : '<b style="color:var(--fg)">' + d.label + '</b><div class="mono" style="color:var(--dim);font-size:10px">' + d.sub + '</div>')
+          + '</td>'
+          + '<td>' + s.total + '</td>'
+          + '<td>' + s.same + '</td>'
+          + '<td>' + num(s.shifted, 'warn') + '</td>'
+          + '<td>' + num(s.dropped, 'bad') + '</td>'
+          + '<td><span style="color:var(--dim)">' + s.none + '</span></td>'
+          + '</tr>';
+      }).join('')
+    + '</tbody></table></div>'
+    + ((shifted || dropped) ? '' : '<div class="hint" style="margin:8px 0 0">这一页样本里没有出现挪档或丢弃。</div>');
 }
 
 async function loadAnalytics(){
   try {
-    const data = await getJSON('/usage/analytics');
+    // 两个端点并行：矩阵有自己的 §range，失败也不影响 KPI（loadByKey 内部自吞异常）
+    const [data] = await Promise.all([getJSON('/usage/analytics'), loadByKey()]);
     cachedAnalyticsData = data;
     renderAnalytics(data);
   } catch(err) {

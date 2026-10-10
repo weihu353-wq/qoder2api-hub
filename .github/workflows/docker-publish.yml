@@ -58,3 +58,25 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # 冒烟：验证「镜像真的能跑」——构建成功不等于镜像完整。
+      # v1.3.2/v1.3.3 曾漏 COPY 一个模块：构建全绿，容器一启动就 ModuleNotFoundError。
+      - name: 冒烟测试（本地单架构构建 + 关键模块存在性 + 探活）
+        run: |
+          set -euo pipefail
+          IMG="qoder-smoke:${GITHUB_RUN_ID}"
+          docker build -t "$IMG" .
+          # 1) 应用模块必须都在镜像里（用源码里的 import 反查，防「新增文件忘了 COPY」）
+          docker run --rm --entrypoint sh "$IMG" -c 'cd /app && for m in $(grep -hoE "^import (qoder_[a-z_]+)" *.py | awk "{print \$2}" | sort -u); do test -f "/app/$m.py" || { echo "MISSING: $m.py"; exit 1; }; done; echo "all app modules present"'
+          # 2) 关键模块可导入
+          docker run --rm --entrypoint python "$IMG" -c "import qoder_proxy, qoder_anthropic; print('imports ok')"
+          # 3) 进程能启动并响应探活
+          docker run -d --name smoke -p 18790:8790 "$IMG"
+          ok=0
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:18790/ping >/dev/null 2>&1; then ok=1; break; fi
+            sleep 2
+          done
+          if [ "$ok" != "1" ]; then echo "::error::容器未在 60s 内响应 /ping"; docker logs smoke; exit 1; fi
+          echo "冒烟通过"; docker logs smoke | tail -5
+          docker rm -f smoke
